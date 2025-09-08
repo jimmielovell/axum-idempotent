@@ -3,26 +3,38 @@
 [![Documentation](https://docs.rs/axum-idempotent/badge.svg)](https://docs.rs/axum-idempotent)
 [![Crates.io](https://img.shields.io/crates/v/axum-idempotent.svg)](https://crates.io/crates/axum-idempotent)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/rust-1.75.0%2B-blue.svg?maxAge=3600)](https://github.com/jimmielovell/axum-idempotent)
+[![Rust](https://img.shields.io/badge/rust-1.85.0%2B-blue.svg?maxAge=3600)](https://github.com/jimmielovell/axum-idempotent)
 
 Middleware for handling idempotent requests in axum applications.
 
-This crate provides middleware that ensures idempotency of HTTP requests by caching responses
-in a session store. When an identical request is made within the configured time window,
-the cached response is returned instead of executing the request again.
+This crate provides middleware that ensures idempotency of HTTP requests. When an identical request is made, a cached response is returned instead of re-executing the handler, preventing duplicate operations like accidental double payments.
+
+## How it Works
+
+The middleware operates in one of two modes:
+
+1.  **Direct Key Mode (Recommended):** By configuring `use_idempotency_key_header()`, the middleware uses a client-provided header (e.g., `Idempotency-Key`) value directly as the cache key. This is the most performant and observable method, as it avoids server-side hashing and uses an identifier known to both the client and server.
+
+2.  **Hashing Mode:** If not using a direct key, a unique hash is generated from the request's method, path, headers (configurable), and body. This hash is then used as the cache key.
+
+If a key is found in the session store, the cached response is returned immediately. If not, the request is processed by the handler, and the response is cached before being sent to the client.
 
 ## Features
 
-- Request deduplication based on method, path, headers, and body
-- Configurable response caching duration
-- Header filtering options to exclude specific headers from idempotency checks
-- Integration with session-based storage (via [ruts](https://crates.io/crates/ruts))
+-   Request deduplication using either a direct client-provided key or automatic request hashing.
+-   Configurable response caching duration.
+-   Fine-grained controls for hashing, including ignoring the request body or specific headers.
+-   Observability through a replay header (default: `idempotency-replayed`) on cached responses.
+-   Seamless integration with session-based storage via the [ruts](https://crates.io/crates/ruts) crate.
 
-## Dependencies
+## Dependencies and Layer Ordering
 
-This middleware requires the `SessionLayer` from the [ruts](https://crates.io/crates/ruts) crate. The layers must be added in the correct order:
-1. `SessionLayer`
-2. `IdempotentLayer`
+This middleware requires a session layer, such as `SessionLayer` from the [ruts](https://crates.io/crates/ruts) crate. For the `IdempotentLayer` to access the session, it must be placed *inside* the `SessionLayer`.
+
+The correct order is:
+1.  `CookieManagerLayer` (Outermost)
+2.  `SessionLayer`
+3.  `IdempotentLayer` (Innermost)
 
 ## Usage
 
@@ -30,7 +42,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-axum-idempotent = "0.1.5"
+axum-idempotent = "0.1.6"
 ```
 
 ## Example
@@ -38,34 +50,32 @@ axum-idempotent = "0.1.5"
 ```rust
 use std::sync::Arc;
 use axum::{Router, routing::post};
-use fred::clients::Client;
-use fred::interfaces::ClientLike;
 use ruts::{CookieOptions, SessionLayer};
 use axum_idempotent::{IdempotentLayer, IdempotentOptions};
-use ruts::store::redis::RedisStore;
 use tower_cookies::CookieManagerLayer;
+use ruts::store::memory::MemoryStore;
 
 #[tokio::main]
 async fn main() {
-    let client = Client::default();
-    client.init().await.unwrap();
-    let store = Arc::new(RedisStore::new(Arc::new(client)));
+    // Your session store
+    let store = Arc::new(MemoryStore::new());
 
-    // Configure the idempotency layer
+    // Configure the idempotency layer to use the "Idempotency-Key" header
     let idempotent_options = IdempotentOptions::default()
-        .expire_after(60)  // Cache responses for 60 seconds
-        .ignore_header("x-request-id".parse().unwrap());
+        .use_idempotency_key_header(Some("Idempotency-Key"))
+        .expire_after(60 * 5); // Cache responses for 5 minutes
 
-    // Create the router with idempotency middleware
+    // Create the router with the correct layer order
     let app = Router::new()
         .route("/payments", post(process_payment))
-        .layer(IdempotentLayer::<RedisStore<Client>>::new(idempotent_options))
+        .layer(IdempotentLayer::<MemoryStore>::new(idempotent_options))
         .layer(SessionLayer::new(store)
-            .with_cookie_options(CookieOptions::build()
-                .name("session")
-                .max_age(3600)
-                .path("/")))
+            .with_cookie_options(CookieOptions::build().name("session")))
         .layer(CookieManagerLayer::new());
+
+    // Run the server
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn process_payment() -> &'static str {
@@ -73,19 +83,44 @@ async fn process_payment() -> &'static str {
 }
 ```
 
-## How it Works
+## Default Behavior
 
-1. When a request is received, a hash is generated from the request method, path, headers (configurable), and body.
-2. If an identical request (same hash) is found in the session store and hasn't expired:
-    - The cached response is returned
-    - The original handler is not called
-3. If no cached response is found:
-    - The request is processed normally
-    - The response is cached in the session store
-    - The response is returned to the client
+`axum-idempotent` is configured with safe defaults to prevent common issues.
 
-This ensures that retrying the same request (e.g., due to network issues or client retries)
-won't result in the operation being performed multiple times.
+### Ignored Status Codes
+
+To avoid caching transient server errors or certain client errors, responses with the following HTTP status codes are not cached by default:
+
+- 400 Bad Request
+- 401 Unauthorized
+- 403 Forbidden
+- 408 Request Timeout
+- 429 Too Many Requests
+- 500 Internal Server Error
+- 502 Bad Gateway
+- 503 Service Unavailable
+- 504 Gateway Timeout
+
+### Ignored Headers
+
+In hashing mode, common, the following request-specific headers  are ignored by default to ensure that requests from different clients are treated as identical if the core parameters are the same. This does not apply when using use_idempotency_key_header.
+
+- user-agent,
+- accept,
+- accept-encoding,
+- accept-language,
+- cache-control,
+- connection,
+- cookie,
+- host,
+- pragma,
+- referer,
+- sec-fetch-dest,
+- sec-fetch-mode,
+- sec-fetch-site,
+- sec-ch-ua,
+- sec-ch-ua-mobile,
+- sec-ch-ua-platform
 
 ## License
 
