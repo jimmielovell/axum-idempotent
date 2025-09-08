@@ -7,7 +7,13 @@ use std::error::Error;
 use std::str::FromStr;
 use blake3::Hasher;
 
-pub(crate) async fn hash_request(req: Request, options: &IdempotentOptions) -> (Request, String) {
+pub(crate) async fn hash_request(mut req: Request, options: &IdempotentOptions) -> (Request, Option<String>) {
+    if options.use_idempotency_key && options.ignore_body && options.ignore_all_headers {
+        let value =  req.headers().get(&options.idempotency_key_header);
+        let value = value.and_then(|v| v.to_str().ok().map(|v| v.to_string()));
+        return (req, value);
+    }
+
     let mut hasher = Hasher::new();
     hasher.update(req.method().as_str().as_bytes());
     hasher.update(req.uri().path().as_bytes());
@@ -18,7 +24,7 @@ pub(crate) async fn hash_request(req: Request, options: &IdempotentOptions) -> (
             .headers()
             .iter()
             .filter(|(name, value)| {
-                if options.ignored_headers.contains(*name) {
+                if options.ignored_req_headers.contains(*name) {
                     return false;
                 }
                 if let Some(ignored_value) = options.ignored_header_values.get(name.to_owned()) {
@@ -36,12 +42,15 @@ pub(crate) async fn hash_request(req: Request, options: &IdempotentOptions) -> (
         }
     }
 
-    let (parts, body) = req.into_parts();
-    let body_bytes = to_bytes(body, usize::MAX).await.unwrap();
-    hasher.update(&body_bytes);
+    if !options.ignore_body {
+        let (parts, body) = req.into_parts();
+        let body_bytes = to_bytes(body, usize::MAX).await.unwrap();
+        hasher.update(&body_bytes);
 
-    let req = Request::from_parts(parts, Body::from(body_bytes));
-    (req, hasher.finalize().to_string())
+        req = Request::from_parts(parts, Body::from(body_bytes));
+    }
+
+    (req, Some(hasher.finalize().to_string()))
 }
 
 /// Serialize

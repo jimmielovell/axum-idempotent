@@ -1,5 +1,24 @@
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use std::collections::HashSet;
+
+/// When used with `ruts`'s `LayeredStore`, this enum allows you to specify
+/// the caching strategy on a per-request basis.
+///
+/// This requires the `layered-store` feature.
+#[cfg(feature = "layered-store")]
+#[derive(Clone, Debug)]
+pub enum LayeredCacheConfig {
+    /// The default strategy. Writes the idempotent response to both the hot
+    /// and cold stores. You can optionally provide a shorter TTL for the
+    /// hot cache.
+    WriteThrough {
+        hot_cache_ttl_secs: Option<i64>,
+    },
+    /// Writes the idempotent response only to the hot cache.
+    HotCacheOnly,
+    /// Writes the idempotent response only to the cold store.
+    ColdCacheOnly,
+}
 
 /// Configuration options for the idempotency layer.
 ///
@@ -22,31 +41,50 @@ use std::collections::HashSet;
 /// ```
 #[derive(Clone, Debug)]
 pub struct IdempotentOptions {
-    pub(crate) expire_after_seconds: i64,
-    pub(crate) ignored_headers: HashSet<HeaderName>,
+    pub(crate) body_cache_ttl_secs: i64,
+    pub(crate) use_idempotency_key: bool,
+    pub(crate) idempotency_key_header: String,
+    pub(crate) replay_header_name: HeaderName,
+    pub(crate) ignore_body: bool,
+    pub(crate) ignored_req_headers: HashSet<HeaderName>,
+    pub(crate) ignored_res_status_codes: HashSet<StatusCode>,
     pub(crate) ignored_header_values: HeaderMap,
     pub(crate) ignore_all_headers: bool,
+    #[cfg(feature = "layered-store")]
+    pub(crate) layered_cache_config: LayeredCacheConfig,
 }
 
 impl IdempotentOptions {
-    pub fn new(expire_after_seconds: i64) -> Self {
+    pub fn new(body_cache_ttl_secs: i64) -> Self {
         Self {
-            expire_after_seconds,
-            ignored_headers: HashSet::new(),
-            ignored_header_values: HeaderMap::new(),
-            ignore_all_headers: false,
+            body_cache_ttl_secs,
+           ..Default::default()
         }
     }
 
     /// Sets the expiration time in seconds for cached responses.
     pub fn expire_after(mut self, seconds: i64) -> Self {
-        self.expire_after_seconds = seconds;
+        self.body_cache_ttl_secs = seconds;
+        self
+    }
+
+    /// Whether the request body should be ignored when calculating the idempotency key.
+    ///
+    /// By default, the request body is included in the key. If you set this to `true`,
+    /// only the request method, path, and headers will be used.
+    ///
+    /// **NOTE:** Setting this to `true` can significantly improve performance as it avoids
+    /// reading the entire request body into memory. However, it also means that two requests
+    /// with different bodies will be treated as identical if their method, path, and headers
+    /// are the same, which may not be the desired behavior.
+    pub fn ignore_body(mut self, ignore: bool) -> Self {
+        self.ignore_body = ignore;
         self
     }
 
     /// Adds a header to the list of headers that should be ignored when calculating the request hash.
     pub fn ignore_header(mut self, name: HeaderName) -> Self {
-        self.ignored_headers.insert(name);
+        self.ignored_req_headers.insert(name);
         self
     }
 
@@ -65,18 +103,73 @@ impl IdempotentOptions {
         self.ignore_all_headers = true;
         self
     }
+
+    /// Adds a StatusCode to the list of status coded that should be ignored when
+    /// determining whether to cache the response or not.
+    pub fn ignore_response_status_code(mut self, status_code: StatusCode) -> Self {
+        self.ignored_res_status_codes.insert(status_code);
+        self
+    }
+
+    /// Configures the middleware to use a request header's value directly as the idempotency key.
+    ///
+    /// When this option is enabled, the middleware will **not** hash any part of the request.
+    /// Instead, it will look for the specified header (default: "idempotency-key") and use its
+    /// value as the unique key for cache lookups.
+    ///
+    /// This is the most performant method and improves debuggability, as the client-provided key
+    /// is the same key used in the cache.
+    ///
+    /// **NOTE:** As a consequence, all other parts of the request, including other headers and the
+    /// request body, are ignored for the purpose of the idempotency check.
+    pub fn use_idempotency_key_header(mut self, header_name: Option<&str>) -> Self {
+        self.ignore_all_headers = true;
+        self.ignore_body = true;
+        self.use_idempotency_key = true;
+        header_name.map(|n| {
+            self.idempotency_key_header = n.to_string();
+        });
+        self
+    }
+
+    /// Sets the name of the header added to a response to indicate it was served from the cache.
+    ///
+    /// The default header is `idempotency-replayed: true`.
+    pub fn replay_header_name(mut self, name: &'static str) -> Self {
+        self.replay_header_name = HeaderName::from_static(name);
+        self
+    }
+
+    /// When used with `ruts`'s `LayeredStore`, this sets the desired caching
+    /// strategy for the idempotent response.
+    ///
+    /// This requires the `layered-store` feature.
+    #[cfg(feature = "layered-store")]
+    pub fn layered_cache_config(mut self, config: LayeredCacheConfig) -> Self {
+        self.layered_cache_config = config;
+        self
+    }
 }
 
 impl Default for IdempotentOptions {
     fn default() -> Self {
         let mut options = Self {
-            expire_after_seconds: 300, // 5 mins default
-            ignored_headers: HashSet::new(),
+            use_idempotency_key: false,
+            idempotency_key_header: String::from("idempotency-key"),
+            replay_header_name: HeaderName::from_static("idempotency-replayed"),
+            body_cache_ttl_secs: 60 * 5, // 5 mins default
+            ignore_body: false,
+            ignored_req_headers: HashSet::new(),
             ignored_header_values: HeaderMap::new(),
+            ignored_res_status_codes: HashSet::new(),
             ignore_all_headers: false,
+            #[cfg(feature = "layered-store")]
+            layered_cache_config: LayeredCacheConfig::WriteThrough {
+                hot_cache_ttl_secs: None
+            },
         };
 
-        let default_ignored = [
+        let default_ignored_headers = [
             "user-agent",
             "accept",
             "accept-encoding",
@@ -95,10 +188,28 @@ impl Default for IdempotentOptions {
             "sec-ch-ua-platform",
         ];
 
-        for header in default_ignored {
+        for header in default_ignored_headers {
             options
-                .ignored_headers
+                .ignored_req_headers
                 .insert(HeaderName::from_static(header));
+        }
+
+        let default_ignored_status_codes = [
+            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_REQUEST,
+            StatusCode::FORBIDDEN,
+            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::UNAUTHORIZED
+        ];
+
+        for status_code in default_ignored_status_codes {
+            options
+                .ignored_res_status_codes
+                .insert(status_code);
         }
 
         options
