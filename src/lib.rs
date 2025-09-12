@@ -39,8 +39,8 @@
 //! use tower_cookies::CookieManagerLayer;
 //! use ruts::store::memory::MemoryStore;
 //!
-//! # #[tokio::main]
-//! # async fn main() {
+//! #[tokio::main]
+//! async fn main() {
 //! // Your session store
 //! let store = Arc::new(MemoryStore::new());
 //!
@@ -57,13 +57,13 @@
 //!         .with_cookie_options(CookieOptions::build().name("session")))
 //!     .layer(CookieManagerLayer::new());
 //!
-//! # let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-//! # axum::serve(listener, app).await.unwrap();
-//! # }
-//! #
-//! # async fn process_payment() -> &'static str {
-//! #     "Payment processed"
-//! # }
+//! let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+//!     axum::serve(listener, app).await.unwrap();
+//! }
+//! 
+//! async fn process_payment() -> &'static str {
+//!     "Payment processed"
+//! }
 //! ```
 //!
 //! ## Default Behavior
@@ -126,9 +126,6 @@ mod utils;
 mod config;
 pub use crate::config::IdempotentOptions;
 use crate::utils::{bytes_to_response, hash_request, response_to_bytes};
-
-#[cfg(feature = "layered-store")]
-pub use crate::config::LayeredCacheConfig;
 
 /// Service that handles idempotent request processing.
 #[derive(Clone, Debug)]
@@ -239,16 +236,16 @@ where
 ///
 /// # Example
 /// ```rust,no_run
-/// # use std::sync::Arc;
-/// # use axum::Router;
-/// # use axum::routing::get;
-/// # use ruts::{CookieOptions, SessionLayer};
-/// # use axum_idempotent::{IdempotentLayer, IdempotentOptions};
-/// # use tower_cookies::CookieManagerLayer;
+/// use std::sync::Arc;
+/// use axum::Router;
+/// use axum::routing::get;
+/// use ruts::{CookieOptions, SessionLayer};
+/// use axum_idempotent::{IdempotentLayer, IdempotentOptions};
+/// use tower_cookies::CookieManagerLayer;
 ///
-/// # #[tokio::main]
-/// # async fn main() {
-/// # use ruts::store::memory::MemoryStore;
+/// #[tokio::main]
+/// async fn main() {
+/// use ruts::store::memory::MemoryStore;
 /// let store = Arc::new(MemoryStore::new());
 ///
 /// let idempotent_options = IdempotentOptions::default().expire_after(3);
@@ -260,9 +257,9 @@ where
 ///     .layer(SessionLayer::new(store.clone())
 ///         .with_cookie_options(CookieOptions::build().name("session").max_age(10).path("/")))
 ///     .layer(CookieManagerLayer::new());
-/// # let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-/// # axum::serve(listener, app).await.unwrap();
-/// # }
+/// let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+/// axum::serve(listener, app).await.unwrap();
+/// }
 /// ```
 #[derive(Clone, Debug)]
 pub struct IdempotentLayer<T> {

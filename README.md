@@ -36,14 +36,6 @@ The correct order is:
 2.  `SessionLayer`
 3.  `IdempotentLayer` (Innermost)
 
-## Usage
-
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-axum-idempotent = "0.1.7"
-```
 
 ## Example
 
