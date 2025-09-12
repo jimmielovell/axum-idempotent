@@ -22,7 +22,7 @@ blake3 = "1.8.2"
 tower-service = "0.3.3"
 tower-layer = "0.3.3"
 tracing = "0.1.41"
-ruts = "0.6.6"
+ruts = "0.6.7"
 
 [dev-dependencies]
 tower-cookies = "0.11.0"
