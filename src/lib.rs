@@ -198,31 +198,33 @@ where
             let res = inner.call(req).await?;
             let status_code = res.status();
             if !config.ignored_res_status_codes.contains(&status_code) {
-                let (res, response_bytes) = response_to_bytes(res).await;
-
-                #[cfg(feature = "layered-store")]
-                let response_bytes = {
-                    use ruts::store::layered::LayeredWriteStrategy;
-                    
-                    match config.layered_cache_config {
-                        LayeredCacheConfig::WriteThrough { hot_cache_ttl_secs } => {
-                            LayeredWriteStrategy::WriteThrough(response_bytes, hot_cache_ttl_secs)
-                        }
-                        LayeredCacheConfig::HotCacheOnly => LayeredWriteStrategy::HotCache(response_bytes),
-                        LayeredCacheConfig::ColdCacheOnly => LayeredWriteStrategy::ColdCache(response_bytes)
-                    }
-                };
-
                 if let Some(hash) = &hash {
-                    if let Err(err) = session
+                    let (res, response_bytes) = response_to_bytes(res).await;
+
+                    #[cfg(feature = "layered-store")]
+                    let result = {
+                        use ruts::store::layered::LayeredWriteStrategy;
+                        if let Some(hot_cache_ttl_secs) = config.layered_hot_cache_ttl_secs {
+                            session
+                                .update(&hash, &LayeredWriteStrategy(response_bytes, hot_cache_ttl_secs), Some(config.body_cache_ttl_secs))
+                                .await
+                        } else {
+                            session
+                                .update(&hash, &response_bytes, Some(config.body_cache_ttl_secs))
+                                .await
+                        }
+                    };
+                    #[cfg(not(feature = "layered-store"))]
+                    let result = session
                         .update(&hash, &response_bytes, Some(config.body_cache_ttl_secs))
-                        .await
-                    {
+                        .await;
+
+                    if let Err(err) = result {
                         tracing::error!("Failed to cache idempotent response: {err:?}");
                     }
+
+                    return Ok(res)
                 }
-                
-                return Ok(res)
             }
 
             Ok(res)
