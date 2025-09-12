@@ -51,7 +51,7 @@ pub struct IdempotentOptions {
     pub(crate) ignored_header_values: HeaderMap,
     pub(crate) ignore_all_headers: bool,
     #[cfg(feature = "layered-store")]
-    pub(crate) layered_cache_config: LayeredCacheConfig,
+    pub(crate) layered_hot_cache_ttl_secs: Option<i64>,
 }
 
 impl IdempotentOptions {
@@ -145,8 +145,8 @@ impl IdempotentOptions {
     ///
     /// This requires the `layered-store` feature.
     #[cfg(feature = "layered-store")]
-    pub fn layered_cache_config(mut self, config: LayeredCacheConfig) -> Self {
-        self.layered_cache_config = config;
+    pub fn layered_cache_config(mut self, hot_cache_ttl_secs: i64) -> Self {
+        self.layered_hot_cache_ttl_secs = Some(hot_cache_ttl_secs);
         self
     }
 }
@@ -164,9 +164,7 @@ impl Default for IdempotentOptions {
             ignored_res_status_codes: HashSet::new(),
             ignore_all_headers: false,
             #[cfg(feature = "layered-store")]
-            layered_cache_config: LayeredCacheConfig::WriteThrough {
-                hot_cache_ttl_secs: None
-            },
+            layered_hot_cache_ttl_secs: None
         };
 
         let default_ignored_headers = [
