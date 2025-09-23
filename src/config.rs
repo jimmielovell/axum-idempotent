@@ -1,25 +1,6 @@
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use std::collections::HashSet;
 
-/// When used with `ruts`'s `LayeredStore`, this enum allows you to specify
-/// the caching strategy on a per-request basis.
-///
-/// This requires the `layered-store` feature.
-#[cfg(feature = "layered-store")]
-#[derive(Clone, Debug)]
-pub enum LayeredCacheConfig {
-    /// The default strategy. Writes the idempotent response to both the hot
-    /// and cold stores. You can optionally provide a shorter TTL for the
-    /// hot cache.
-    WriteThrough {
-        hot_cache_ttl_secs: Option<i64>,
-    },
-    /// Writes the idempotent response only to the hot cache.
-    HotCacheOnly,
-    /// Writes the idempotent response only to the cold store.
-    ColdCacheOnly,
-}
-
 /// Configuration options for the idempotency layer.
 ///
 /// Configure:
@@ -41,7 +22,6 @@ pub enum LayeredCacheConfig {
 /// ```
 #[derive(Clone, Debug)]
 pub struct IdempotentOptions {
-    pub(crate) body_cache_ttl_secs: i64,
     pub(crate) use_idempotency_key: bool,
     pub(crate) idempotency_key_header: String,
     pub(crate) replay_header_name: HeaderName,
@@ -50,6 +30,7 @@ pub struct IdempotentOptions {
     pub(crate) ignored_res_status_codes: HashSet<StatusCode>,
     pub(crate) ignored_header_values: HeaderMap,
     pub(crate) ignore_all_headers: bool,
+    pub(crate) body_cache_ttl_secs: i64,
     #[cfg(feature = "layered-store")]
     pub(crate) layered_hot_cache_ttl_secs: Option<i64>,
 }

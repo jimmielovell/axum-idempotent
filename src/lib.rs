@@ -199,21 +199,12 @@ where
                     let (res, response_bytes) = response_to_bytes(res).await;
 
                     #[cfg(feature = "layered-store")]
-                    let result = {
-                        use ruts::store::layered::LayeredWriteStrategy;
-                        if let Some(hot_cache_ttl_secs) = config.layered_hot_cache_ttl_secs {
-                            session
-                                .update(&hash, &LayeredWriteStrategy(response_bytes, hot_cache_ttl_secs), Some(config.body_cache_ttl_secs))
-                                .await
-                        } else {
-                            session
-                                .update(&hash, &response_bytes, Some(config.body_cache_ttl_secs))
-                                .await
-                        }
-                    };
+                    let result = session
+                        .update(&hash, &response_bytes, Some(config.body_cache_ttl_secs), config.layered_hot_cache_ttl_secs)
+                        .await;
                     #[cfg(not(feature = "layered-store"))]
                     let result = session
-                        .update(&hash, &response_bytes, Some(config.body_cache_ttl_secs))
+                        .update(&hash, &response_bytes, Some(config.body_cache_ttl_secs), None)
                         .await;
 
                     if let Err(err) = result {
