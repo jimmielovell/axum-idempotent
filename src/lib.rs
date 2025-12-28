@@ -200,11 +200,11 @@ where
 
                     #[cfg(feature = "layered-store")]
                     let result = session
-                        .update(&hash, &response_bytes, Some(config.body_cache_ttl_secs), config.layered_hot_cache_ttl_secs)
+                        .set(&hash, &response_bytes, Some(config.body_cache_ttl_secs), config.layered_hot_cache_ttl_secs)
                         .await;
                     #[cfg(not(feature = "layered-store"))]
                     let result = session
-                        .update(&hash, &response_bytes, Some(config.body_cache_ttl_secs), None)
+                        .set(&hash, &response_bytes, Some(config.body_cache_ttl_secs), None)
                         .await;
 
                     if let Err(err) = result {

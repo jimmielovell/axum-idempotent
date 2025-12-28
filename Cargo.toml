@@ -1,7 +1,7 @@
 [package]
 name = "axum-idempotent"
 description = "A middleware for handling idempotent requests in axum applications."
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["Jimmie Lovell <jimmieomlovell@gmail.com>"]
@@ -17,16 +17,16 @@ readme = "README.md"
 layered-store = ["ruts/layered-store"]
 
 [dependencies]
-axum = { version = "0.8.4" }
+axum = { version = "0.8.8" }
 blake3 = "1.8.2"
 tower-service = "0.3.3"
 tower-layer = "0.3.3"
-tracing = "0.1.41"
-ruts = "0.7.1"
+tracing = "0.1.44"
+ruts = "0.7.2"
 
 [dev-dependencies]
 tower-cookies = "0.11.0"
-tokio = { version = "1.47.1", features = ["full"] }
+tokio = { version = "1.48.0", features = ["full"] }
 tower = "0.5.2"
 
 [[test]]
