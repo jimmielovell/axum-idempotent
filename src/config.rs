@@ -39,7 +39,7 @@ impl IdempotentOptions {
     pub fn new(body_cache_ttl_secs: i64) -> Self {
         Self {
             body_cache_ttl_secs,
-           ..Default::default()
+            ..Default::default()
         }
     }
 
@@ -145,7 +145,7 @@ impl Default for IdempotentOptions {
             ignored_res_status_codes: HashSet::new(),
             ignore_all_headers: false,
             #[cfg(feature = "layered-store")]
-            layered_hot_cache_ttl_secs: None
+            layered_hot_cache_ttl_secs: None,
         };
 
         let default_ignored_headers = [
@@ -182,13 +182,11 @@ impl Default for IdempotentOptions {
             StatusCode::REQUEST_TIMEOUT,
             StatusCode::SERVICE_UNAVAILABLE,
             StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::UNAUTHORIZED
+            StatusCode::UNAUTHORIZED,
         ];
 
         for status_code in default_ignored_status_codes {
-            options
-                .ignored_res_status_codes
-                .insert(status_code);
+            options.ignored_res_status_codes.insert(status_code);
         }
 
         options

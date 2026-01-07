@@ -1,15 +1,18 @@
 use crate::config::IdempotentOptions;
-use axum::body::{to_bytes, Body};
+use axum::body::{Body, to_bytes};
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::Response;
+use blake3::Hasher;
 use std::error::Error;
 use std::str::FromStr;
-use blake3::Hasher;
 
-pub(crate) async fn hash_request(mut req: Request, options: &IdempotentOptions) -> (Request, Option<String>) {
+pub(crate) async fn hash_request(
+    mut req: Request,
+    options: &IdempotentOptions,
+) -> (Request, Option<String>) {
     if options.use_idempotency_key && options.ignore_body && options.ignore_all_headers {
-        let value =  req.headers().get(&options.idempotency_key_header);
+        let value = req.headers().get(&options.idempotency_key_header);
         let value = value.and_then(|v| v.to_str().ok().map(|v| v.to_string()));
         return (req, value);
     }

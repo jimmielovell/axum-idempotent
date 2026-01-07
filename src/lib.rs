@@ -60,7 +60,7 @@
 //! let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
 //!     axum::serve(listener, app).await.unwrap();
 //! }
-//! 
+//!
 //! async fn process_payment() -> &'static str {
 //!     "Payment processed"
 //! }
@@ -108,11 +108,11 @@
 //! - sec-ch-ua-mobile,
 //! - sec-ch-ua-platform
 
+use axum::RequestExt;
 use axum::extract::Request;
 use axum::response::Response;
-use axum::RequestExt;
-use ruts::store::SessionStore;
 use ruts::Session;
+use ruts::store::SessionStore;
 use std::error::Error;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -182,9 +182,9 @@ where
                     Ok(Some(mut res)) => {
                         res.headers_mut()
                             .insert(config.replay_header_name, "true".parse().unwrap());
-                        return Ok(res)
-                    },
-                    Ok(None) => {}  // No cached response, continue
+                        return Ok(res);
+                    }
+                    Ok(None) => {} // No cached response, continue
                     Err(err) => {
                         tracing::error!("Failed to check idempotent cached response: {err:?}");
                         // Continue without cache
@@ -200,18 +200,28 @@ where
 
                     #[cfg(feature = "layered-store")]
                     let result = session
-                        .set(&hash, &response_bytes, Some(config.body_cache_ttl_secs), config.layered_hot_cache_ttl_secs)
+                        .set(
+                            &hash,
+                            &response_bytes,
+                            Some(config.body_cache_ttl_secs),
+                            config.layered_hot_cache_ttl_secs,
+                        )
                         .await;
                     #[cfg(not(feature = "layered-store"))]
                     let result = session
-                        .set(&hash, &response_bytes, Some(config.body_cache_ttl_secs), None)
+                        .set(
+                            &hash,
+                            &response_bytes,
+                            Some(config.body_cache_ttl_secs),
+                            None,
+                        )
                         .await;
 
                     if let Err(err) = result {
                         tracing::error!("Failed to cache idempotent response: {err:?}");
                     }
 
-                    return Ok(res)
+                    return Ok(res);
                 }
             }
 

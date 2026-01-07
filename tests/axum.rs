@@ -1,16 +1,16 @@
 #[cfg(test)]
 mod tests {
-    use axum::body::{to_bytes, Body};
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
     use axum::extract::Request;
     use axum::http::{HeaderName, StatusCode};
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
-    use axum::Router;
     use axum_idempotent::{IdempotentLayer, IdempotentOptions};
     use ruts::store::memory::MemoryStore;
     use ruts::{CookieOptions, SessionLayer};
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use tower::ServiceExt;
     use tower_cookies::CookieManagerLayer;
@@ -112,7 +112,8 @@ mod tests {
     #[tokio::test]
     async fn test_idempotency_key_header_mode() {
         reset_counter();
-        let options = IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"));
+        let options =
+            IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"));
         let app = create_test_app(options).await;
 
         let response1 = app
@@ -207,8 +208,8 @@ mod tests {
     #[tokio::test]
     async fn test_ignore_header_mode() {
         reset_counter();
-        let options = IdempotentOptions::default()
-            .ignore_header(HeaderName::from_static("x-request-id"));
+        let options =
+            IdempotentOptions::default().ignore_header(HeaderName::from_static("x-request-id"));
         let app = create_test_app(options).await;
 
         let response1 = app
@@ -251,7 +252,12 @@ mod tests {
 
         let response1 = app
             .clone()
-            .oneshot(Request::builder().uri("/error").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/error")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
