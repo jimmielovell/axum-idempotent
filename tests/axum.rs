@@ -8,7 +8,7 @@ mod tests {
     use axum::routing::{get, post};
     use axum_idempotent::{IdempotentLayer, IdempotentOptions};
     use ruts::store::memory::MemoryStore;
-    use ruts::{CookieOptions, SessionLayer};
+    use ruts::{CookieOptions, Session, SessionLayer};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
@@ -45,6 +45,25 @@ mod tests {
                     async move {
                         counter.fetch_add(1, Ordering::SeqCst);
                         (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+                    }
+                }),
+            )
+            // Writes and reads an ordinary application session field, to check that
+            // the middleware never addresses the same namespace.
+            .route(
+                "/app-field",
+                post(|session: Session<MemoryStore>| async move {
+                    session
+                        .set("user", &String::from("alice"), None, None)
+                        .await
+                        .unwrap();
+                    "stored"
+                })
+                .get(|session: Session<MemoryStore>| async move {
+                    match session.get::<String>("user").await {
+                        Ok(Some(user)) => user,
+                        Ok(None) => String::from("<missing>"),
+                        Err(_) => String::from("<corrupt>"),
                     }
                 }),
             )
@@ -248,6 +267,68 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1); // Counter did not increment.
         let body = to_bytes(response2.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"Response #0");
+    }
+
+    /// A client-supplied idempotency key must not be able to address an
+    /// application session field, either to read it or to overwrite it.
+    #[tokio::test]
+    async fn test_idempotency_key_cannot_address_application_session_fields() {
+        let options =
+            IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"));
+        let (app, counter) = create_test_app(options);
+
+        // Establish a session holding an application field named "user".
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app-field")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let session_cookie = get_session_cookie(&response);
+
+        // A request whose idempotency key collides with that field name.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .method("POST")
+                    .header("cookie", session_cookie.clone())
+                    .header("idempotency-key", "user")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert!(
+            response.headers().get("idempotency-replayed").is_none(),
+            "an application field must not be served as a cached response"
+        );
+
+        // The application field must be untouched.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/app-field")
+                    .method("GET")
+                    .header("cookie", session_cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            &body[..],
+            b"alice",
+            "the idempotency key overwrote an application session field"
+        );
     }
 
     #[tokio::test]
