@@ -15,34 +15,44 @@ mod tests {
     use tower::ServiceExt;
     use tower_cookies::CookieManagerLayer;
 
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    fn reset_counter() {
-        COUNTER.store(0, Ordering::SeqCst);
-    }
-
-    async fn increment_counter() -> String {
-        let count = COUNTER.fetch_add(1, Ordering::SeqCst);
-        format!("Response #{}", count)
-    }
-
-    async fn return_error() -> impl IntoResponse {
-        COUNTER.fetch_add(1, Ordering::SeqCst);
-        (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
-    }
-
-    async fn create_test_app(idempotent_options: IdempotentOptions) -> Router {
+    /// Builds an app along with the counter its handlers increment.
+    ///
+    /// The counter is per-app rather than a shared static so that tests remain
+    /// independent when the harness runs them in parallel.
+    fn create_test_app(idempotent_options: IdempotentOptions) -> (Router, Arc<AtomicU64>) {
         let store = Arc::new(MemoryStore::new());
         let cookie_options = CookieOptions::build().name("session").max_age(10).path("/");
         let session_layer = SessionLayer::new(store.clone()).with_cookie_options(cookie_options);
         let idempotent_layer = IdempotentLayer::<MemoryStore>::new(idempotent_options);
 
-        Router::new()
-            .route("/test", post(increment_counter))
-            .route("/error", get(return_error))
+        let counter = Arc::new(AtomicU64::new(0));
+
+        let test_counter = counter.clone();
+        let error_counter = counter.clone();
+
+        let app = Router::new()
+            .route(
+                "/test",
+                post(move || {
+                    let counter = test_counter.clone();
+                    async move { format!("Response #{}", counter.fetch_add(1, Ordering::SeqCst)) }
+                }),
+            )
+            .route(
+                "/error",
+                get(move || {
+                    let counter = error_counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+                    }
+                }),
+            )
             .layer(idempotent_layer)
             .layer(session_layer)
-            .layer(CookieManagerLayer::new())
+            .layer(CookieManagerLayer::new());
+
+        (app, counter)
     }
 
     fn get_session_cookie(response: &axum::http::Response<Body>) -> axum::http::HeaderValue {
@@ -57,9 +67,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_idempotency_with_hashing() {
-        reset_counter();
         let options = IdempotentOptions::default().expire_after(3);
-        let app = create_test_app(options).await;
+        let (app, _counter) = create_test_app(options);
 
         let response1 = app
             .clone()
@@ -111,10 +120,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_idempotency_key_header_mode() {
-        reset_counter();
         let options =
             IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"));
-        let app = create_test_app(options).await;
+        let (app, counter) = create_test_app(options);
 
         let response1 = app
             .clone()
@@ -130,7 +138,7 @@ mod tests {
             .unwrap();
 
         let session_cookie = get_session_cookie(&response1);
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert!(response1.headers().get("idempotency-replayed").is_none());
 
         let response2 = app
@@ -146,7 +154,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 1); // Counter did not increment.
+        assert_eq!(counter.load(Ordering::SeqCst), 1); // Counter did not increment.
         assert_eq!(
             response2.headers().get("idempotency-replayed").unwrap(),
             "true"
@@ -164,14 +172,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 2); // Counter incremented.
+        assert_eq!(counter.load(Ordering::SeqCst), 2); // Counter incremented.
     }
 
     #[tokio::test]
     async fn test_ignore_body_mode() {
-        reset_counter();
         let options = IdempotentOptions::default().ignore_body(true);
-        let app = create_test_app(options).await;
+        let (app, counter) = create_test_app(options);
 
         // First request executes handler.
         let response1 = app
@@ -186,7 +193,7 @@ mod tests {
             .await
             .unwrap();
         let session_cookie = get_session_cookie(&response1);
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
 
         // Second request with a different body should be treated as identical and return a cached response.
         let response2 = app
@@ -200,17 +207,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 1); // Counter did not increment.
+        assert_eq!(counter.load(Ordering::SeqCst), 1); // Counter did not increment.
         let body = to_bytes(response2.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"Response #0");
     }
 
     #[tokio::test]
     async fn test_ignore_header_mode() {
-        reset_counter();
         let options =
             IdempotentOptions::default().ignore_header(HeaderName::from_static("x-request-id"));
-        let app = create_test_app(options).await;
+        let (app, counter) = create_test_app(options);
 
         let response1 = app
             .clone()
@@ -225,7 +231,7 @@ mod tests {
             .await
             .unwrap();
         let session_cookie = get_session_cookie(&response1);
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
 
         let response2 = app
             .oneshot(
@@ -239,16 +245,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 1); // Counter did not increment.
+        assert_eq!(counter.load(Ordering::SeqCst), 1); // Counter did not increment.
         let body = to_bytes(response2.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"Response #0");
     }
 
     #[tokio::test]
     async fn test_ignored_status_code() {
-        reset_counter();
         let options = IdempotentOptions::default();
-        let app = create_test_app(options).await;
+        let (app, counter) = create_test_app(options);
 
         let response1 = app
             .clone()
@@ -271,7 +276,7 @@ mod tests {
             session_cookie.is_none(),
             "A session cookie should NOT be set on an error response"
         );
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(response1.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         let response2 = app
@@ -284,7 +289,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(COUNTER.load(Ordering::SeqCst), 2); // Counter incremented again.
+        assert_eq!(counter.load(Ordering::SeqCst), 2); // Counter incremented again.
         assert_eq!(response2.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
