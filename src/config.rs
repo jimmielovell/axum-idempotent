@@ -103,6 +103,11 @@ impl IdempotentOptions {
     ///
     /// **NOTE:** As a consequence, all other parts of the request, including other headers and the
     /// request body, are ignored for the purpose of the idempotency check.
+    ///
+    /// The key must be 1 to 255 printable ASCII characters (no spaces). Requests carrying a key
+    /// outside that range, or no key at all, are passed through without idempotency handling.
+    /// Keys are namespaced internally, so they cannot collide with the session fields your
+    /// application stores.
     pub fn use_idempotency_key_header(mut self, header_name: Option<&str>) -> Self {
         self.ignore_all_headers = true;
         self.ignore_body = true;

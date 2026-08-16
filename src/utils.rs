@@ -7,14 +7,46 @@ use blake3::Hasher;
 use std::error::Error;
 use std::str::FromStr;
 
+/// Prefix applied to every session field this middleware writes.
+///
+/// In direct-key mode the key comes straight from the client, so without a
+/// namespace of its own the middleware would read and overwrite whatever
+/// application field happens to share the name.
+const SESSION_FIELD_PREFIX: &str = "idem:";
+
+/// Upper bound on an accepted client-supplied idempotency key.
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
+
+/// A client-supplied key ends up as a session field name, so it is held to a
+/// bounded, printable subset rather than accepted verbatim.
+fn is_usable_idempotency_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_IDEMPOTENCY_KEY_LEN
+        && key.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 pub(crate) async fn hash_request(
     mut req: Request,
     options: &IdempotentOptions,
 ) -> (Request, Option<String>) {
     if options.use_idempotency_key && options.ignore_body && options.ignore_all_headers {
-        let value = req.headers().get(&options.idempotency_key_header);
-        let value = value.and_then(|v| v.to_str().ok().map(|v| v.to_string()));
-        return (req, value);
+        let key = req
+            .headers()
+            .get(&options.idempotency_key_header)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|key| {
+                if is_usable_idempotency_key(key) {
+                    Some(format!("{SESSION_FIELD_PREFIX}{key}"))
+                } else {
+                    // The key itself is never logged: it is unvalidated client input.
+                    tracing::debug!(
+                        "ignoring idempotency key: expected 1-{MAX_IDEMPOTENCY_KEY_LEN} printable ascii characters"
+                    );
+                    None
+                }
+            });
+
+        return (req, key);
     }
 
     let mut hasher = Hasher::new();
@@ -53,7 +85,10 @@ pub(crate) async fn hash_request(
         req = Request::from_parts(parts, Body::from(body_bytes));
     }
 
-    (req, Some(hasher.finalize().to_string()))
+    (
+        req,
+        Some(format!("{}{}", SESSION_FIELD_PREFIX, hasher.finalize())),
+    )
 }
 
 /// Serialize
@@ -182,6 +217,96 @@ mod tests {
 
         let (_, hash3) = hash_request(req3, &IdempotentOptions::default()).await;
         assert_ne!(hash, hash3, "Different body should produce different hash");
+    }
+
+    fn direct_key_options() -> IdempotentOptions {
+        IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"))
+    }
+
+    async fn key_for(header_value: &[u8], options: &IdempotentOptions) -> Option<String> {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+
+        if let Ok(value) = axum::http::HeaderValue::from_bytes(header_value) {
+            req.headers_mut().insert("idempotency-key", value);
+        }
+
+        hash_request(req, options).await.1
+    }
+
+    #[tokio::test]
+    async fn test_hashed_key_is_namespaced() {
+        let (_, key) = hash_request(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/test")
+                .body(Body::from("body"))
+                .unwrap(),
+            &IdempotentOptions::default(),
+        )
+        .await;
+
+        let key = key.unwrap();
+        assert!(key.starts_with(SESSION_FIELD_PREFIX));
+        // blake3 hex digest following the prefix
+        assert_eq!(key.len(), SESSION_FIELD_PREFIX.len() + 64);
+    }
+
+    #[tokio::test]
+    async fn test_direct_key_is_namespaced() {
+        let options = direct_key_options();
+        assert_eq!(
+            key_for(b"key-1", &options).await,
+            Some(String::from("idem:key-1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unusable_direct_keys_are_rejected() {
+        let options = direct_key_options();
+
+        assert_eq!(key_for(b"", &options).await, None, "empty key");
+        assert_eq!(key_for(b"   ", &options).await, None, "whitespace-only key");
+        assert_eq!(
+            key_for(b"has space", &options).await,
+            None,
+            "embedded space"
+        );
+        assert_eq!(key_for(&[0xFF, 0xFE], &options).await, None, "non-utf8 key");
+        assert_eq!(
+            key_for("naïve".as_bytes(), &options).await,
+            None,
+            "non-ascii key"
+        );
+        assert_eq!(
+            key_for(&[b'k'; MAX_IDEMPOTENCY_KEY_LEN + 1], &options).await,
+            None,
+            "over-long key"
+        );
+        assert!(
+            key_for(&[b'k'; MAX_IDEMPOTENCY_KEY_LEN], &options)
+                .await
+                .is_some(),
+            "a key at the length limit is accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_missing_direct_key_disables_caching() {
+        let (_, key) = hash_request(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/test")
+                .body(Body::empty())
+                .unwrap(),
+            &direct_key_options(),
+        )
+        .await;
+
+        assert_eq!(key, None);
     }
 
     #[tokio::test]
