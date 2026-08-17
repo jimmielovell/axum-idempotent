@@ -201,7 +201,12 @@ where
             let status_code = res.status();
             if !config.ignored_res_status_codes.contains(&status_code) {
                 if let Some(hash) = &hash {
-                    let (res, response_bytes) = response_to_bytes(res).await;
+                    let (res, response_bytes) =
+                        response_to_bytes(res, config.max_cached_response_size).await;
+
+                    let Some(response_bytes) = response_bytes else {
+                        return Ok(res);
+                    };
 
                     #[cfg(feature = "layered-store")]
                     let result = session

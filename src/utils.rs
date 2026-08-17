@@ -115,11 +115,37 @@ pub(crate) async fn hash_request(
     ))
 }
 
-/// Serialize
-pub(crate) async fn response_to_bytes(res: Response<Body>) -> (Response, Vec<u8>) {
+/// Serializes a response for caching, returning it alongside the bytes to store.
+///
+/// `None` means the response should not be cached, either because its length is not
+/// known before reading it or because it is over `max_size`.
+pub(crate) async fn response_to_bytes(
+    res: Response<Body>,
+    max_size: usize,
+) -> (Response, Option<Vec<u8>>) {
     let (parts, body) = res.into_parts();
 
-    let body_bytes = to_bytes(body, usize::MAX).await.unwrap();
+    // Only a response of known length is read. Reading a stream here would withhold it
+    // from the client until it ended, which for an open-ended stream never happens.
+    if !body
+        .size_hint()
+        .upper()
+        .is_some_and(|size| size <= max_size as u64)
+    {
+        return (Response::from_parts(parts, body), None);
+    }
+
+    let body_bytes = match to_bytes(body, max_size).await {
+        Ok(bytes) => bytes,
+        // The body is partially consumed, so there is nothing left to send.
+        Err(err) => {
+            tracing::error!("Failed to read response body for caching: {err:?}");
+
+            let mut res = Response::new(Body::empty());
+            *res.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            return (res, None);
+        }
+    };
 
     let mut result = Vec::new();
     // Serialize status code
@@ -141,7 +167,10 @@ pub(crate) async fn response_to_bytes(res: Response<Body>) -> (Response, Vec<u8>
     result.extend_from_slice(b"\r\n\r\n");
     result.extend_from_slice(&body_bytes);
 
-    (Response::from_parts(parts, Body::from(body_bytes)), result)
+    (
+        Response::from_parts(parts, Body::from(body_bytes)),
+        Some(result),
+    )
 }
 
 /// Deserialize bytes back into a `axum::response::Response`.
@@ -436,6 +465,44 @@ mod tests {
         assert!(key.is_some());
     }
 
+    /// Serializes a response that is expected to be cacheable.
+    async fn serialize(res: Response) -> (Response, Vec<u8>) {
+        let (res, bytes) = response_to_bytes(res, usize::MAX).await;
+        (res, bytes.expect("response should be cacheable"))
+    }
+
+    #[tokio::test]
+    async fn test_oversized_response_is_not_cached() {
+        let response = Response::new(Body::from(vec![b'x'; 65]));
+
+        let (res, bytes) = response_to_bytes(response, 64).await;
+
+        assert!(bytes.is_none(), "an oversized response must not be cached");
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.len(), 65, "the client must still get the response");
+    }
+
+    #[tokio::test]
+    async fn test_response_at_the_limit_is_cached() {
+        let response = Response::new(Body::from(vec![b'x'; 64]));
+
+        let (_, bytes) = response_to_bytes(response, 64).await;
+
+        assert!(bytes.is_some());
+    }
+
+    /// Reading a stream to cache it would hold the response until the stream ended.
+    #[tokio::test]
+    async fn test_streaming_response_is_not_cached() {
+        let response = Response::new(chunked_body(vec![Ok(Bytes::from("streamed"))]));
+
+        let (res, bytes) = response_to_bytes(response, usize::MAX).await;
+
+        assert!(bytes.is_none(), "a stream must not be cached");
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"streamed");
+    }
+
     #[tokio::test]
     async fn test_response_to_bytes() {
         let response = Response::builder()
@@ -445,7 +512,7 @@ mod tests {
             .body(Body::from("test response body"))
             .unwrap();
 
-        let (_new_res, bytes) = response_to_bytes(response).await;
+        let (_new_res, bytes) = serialize(response).await;
 
         // Test the serialized response can be deserialized back
         let reconstructed = bytes_to_response(bytes).unwrap();
@@ -477,7 +544,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let (_new_res, bytes) = response_to_bytes(response).await;
+        let (_new_res, bytes) = serialize(response).await;
         let reconstructed = bytes_to_response(bytes).unwrap();
 
         assert_eq!(reconstructed.status(), StatusCode::NO_CONTENT);
@@ -503,7 +570,7 @@ mod tests {
                 .body(Body::empty())
                 .unwrap();
 
-            let (_, bytes) = response_to_bytes(response).await;
+            let (_, bytes) = serialize(response).await;
             let reconstructed = bytes_to_response(bytes).unwrap();
             assert_eq!(reconstructed.status(), status);
         }
@@ -517,7 +584,7 @@ mod tests {
             .body(Body::from(original_body))
             .unwrap();
 
-        let (_, bytes) = response_to_bytes(response).await;
+        let (_, bytes) = serialize(response).await;
         let reconstructed = bytes_to_response(bytes).unwrap();
 
         let body_bytes = to_bytes(reconstructed.into_body(), usize::MAX)
@@ -535,7 +602,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let (_, bytes) = response_to_bytes(response).await;
+        let (_, bytes) = serialize(response).await;
 
         // Skip status code (2 bytes)
         let headers_and_body = &bytes[2..];
