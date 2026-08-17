@@ -1,6 +1,21 @@
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use std::collections::HashSet;
 
+/// Default header read in direct-key mode.
+const DEFAULT_IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
+
+/// Where the cache key comes from.
+///
+/// A single value rather than a set of flags, so that the mode cannot be changed as a
+/// side effect of setting an unrelated option.
+#[derive(Clone, Debug)]
+pub(crate) enum KeySource {
+    /// Hash the request's method, target, headers and body.
+    Hash,
+    /// Take the value of this request header as the key.
+    Header(String),
+}
+
 /// Configuration options for the idempotency layer.
 ///
 /// Configure:
@@ -22,8 +37,8 @@ use std::collections::HashSet;
 /// ```
 #[derive(Clone, Debug)]
 pub struct IdempotentOptions {
-    pub(crate) use_idempotency_key: bool,
-    pub(crate) idempotency_key_header: String,
+    pub(crate) key_source: KeySource,
+    pub(crate) require_idempotency_key: bool,
     pub(crate) replay_header_name: HeaderName,
     pub(crate) ignore_body: bool,
     pub(crate) ignored_req_headers: HashSet<HeaderName>,
@@ -136,27 +151,58 @@ impl IdempotentOptions {
     /// is the same key used in the cache.
     ///
     /// **NOTE:** As a consequence, all other parts of the request, including other headers and the
-    /// request body, are ignored for the purpose of the idempotency check.
+    /// request body, are ignored for the purpose of the idempotency check. This mode is a
+    /// property of the layer, so [`ignore_body`](Self::ignore_body) and
+    /// [`ignore_all_headers`](Self::ignore_all_headers) have no effect once it is set.
     ///
-    /// The key must be 1 to 255 printable ASCII characters (no spaces). Requests carrying a key
-    /// outside that range, or no key at all, are passed through without idempotency handling.
+    /// The key must be 1 to 255 printable ASCII characters (no spaces). A request carrying a
+    /// key outside that range is answered with `400 Bad Request`: the client asked for
+    /// idempotency, so silently withholding it would surface later as a duplicate operation.
+    /// A request carrying *no* key is passed through without idempotency handling, since a
+    /// layer applied across a router sees plenty of requests that are not meant to be
+    /// idempotent — set [`require_idempotency_key`](Self::require_idempotency_key) to reject
+    /// those too.
+    ///
     /// Keys are namespaced internally, so they cannot collide with the session fields your
     /// application stores.
+    ///
+    /// Note that in this mode deduplication is advisory: the client chooses the key, so it
+    /// also chooses whether two requests are treated as the same operation. Hashing mode
+    /// derives the key from the request itself, which a sender cannot opt out of.
     pub fn use_idempotency_key_header(mut self, header_name: Option<&str>) -> Self {
-        self.ignore_all_headers = true;
-        self.ignore_body = true;
-        self.use_idempotency_key = true;
-        header_name.map(|n| {
-            self.idempotency_key_header = n.to_string();
-        });
+        self.key_source = KeySource::Header(
+            header_name
+                .unwrap_or(DEFAULT_IDEMPOTENCY_KEY_HEADER)
+                .to_string(),
+        );
+        self
+    }
+
+    /// Answers a request carrying no idempotency key at all with `400 Bad Request`.
+    ///
+    /// A key that is present but unusable is rejected either way; this covers the ambiguous
+    /// case of a request that carries none. Requiring the header also turns away requests a
+    /// browser can be induced to make cross-origin, which cannot set custom headers without
+    /// a CORS preflight.
+    ///
+    /// Applies only in direct-key mode. The default is to forward such a request to the
+    /// handler without idempotency handling, which is silent: a client that misspells the
+    /// header, or omits it, loses the protection without being told.
+    pub fn require_idempotency_key(mut self, require: bool) -> Self {
+        self.require_idempotency_key = require;
         self
     }
 
     /// Sets the name of the header added to a response to indicate it was served from the cache.
     ///
-    /// The default header is `idempotency-replayed: true`.
-    pub fn replay_header_name(mut self, name: &'static str) -> Self {
-        self.replay_header_name = HeaderName::from_static(name);
+    /// The default header is `idempotency-replayed: true`. The name is case-insensitive.
+    ///
+    /// # Panics
+    ///
+    /// If `name` is not a valid header name.
+    pub fn replay_header_name(mut self, name: &str) -> Self {
+        self.replay_header_name = HeaderName::from_bytes(name.as_bytes())
+            .unwrap_or_else(|_| panic!("`{name}` is not a valid header name"));
         self
     }
 
@@ -174,8 +220,8 @@ impl IdempotentOptions {
 impl Default for IdempotentOptions {
     fn default() -> Self {
         let mut options = Self {
-            use_idempotency_key: false,
-            idempotency_key_header: String::from("idempotency-key"),
+            key_source: KeySource::Hash,
+            require_idempotency_key: false,
             replay_header_name: HeaderName::from_static("idempotency-replayed"),
             body_cache_ttl_secs: 60 * 5, // 5 mins default
             ignore_body: false,

@@ -1,4 +1,4 @@
-use crate::config::IdempotentOptions;
+use crate::config::{IdempotentOptions, KeySource};
 use axum::body::{Body, HttpBody, to_bytes};
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -43,6 +43,13 @@ fn is_usable_idempotency_key(key: &str) -> bool {
         && key.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
+fn bad_request(message: String) -> Response {
+    let mut res = Response::new(Body::from(message));
+    *res.status_mut() = StatusCode::BAD_REQUEST;
+
+    res
+}
+
 /// Builds the response for a request body that could not be buffered.
 fn body_rejection(err: &axum::Error) -> Response {
     let over_limit = std::error::Error::source(err)
@@ -63,20 +70,31 @@ pub(crate) async fn hash_request(
     mut req: Request,
     options: &IdempotentOptions,
 ) -> Result<(Request, Option<String>), Response> {
-    if options.use_idempotency_key && options.ignore_body && options.ignore_all_headers {
-        let key = req
-            .headers()
-            .get(&options.idempotency_key_header)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|key| {
-                if is_usable_idempotency_key(key) {
-                    Some(format!("{SESSION_FIELD_PREFIX}{key}"))
-                } else {
-                    None
-                }
-            });
+    if let KeySource::Header(header_name) = &options.key_source {
+        // Absence is ambiguous: plenty of requests to a layer applied router-wide are
+        // not meant to be idempotent.
+        let Some(value) = req.headers().get(header_name) else {
+            return if options.require_idempotency_key {
+                Err(bad_request(format!("Missing `{header_name}` header")))
+            } else {
+                Ok((req, None))
+            };
+        };
 
-        return Ok((req, key));
+        // A key that is present but unusable is not ambiguous. The client asked for
+        // idempotency, and forwarding the request would withhold it without saying so.
+        let Some(key) = value
+            .to_str()
+            .ok()
+            .filter(|key| is_usable_idempotency_key(key))
+        else {
+            return Err(bad_request(format!(
+                "`{header_name}` must be 1-{MAX_IDEMPOTENCY_KEY_LEN} printable ascii characters"
+            )));
+        };
+
+        let key = format!("{SESSION_FIELD_PREFIX}{key}");
+        return Ok((req, Some(key)));
     }
 
     let mut hasher = Hasher::new();
@@ -383,18 +401,21 @@ mod tests {
         IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"))
     }
 
-    async fn key_for(header_value: &[u8], options: &IdempotentOptions) -> Option<String> {
+    async fn key_for(
+        header_value: &[u8],
+        options: &IdempotentOptions,
+    ) -> Result<Option<String>, Response> {
         let mut req = Request::builder()
             .method(Method::POST)
             .uri("/test")
             .body(Body::empty())
             .unwrap();
 
-        if let Ok(value) = axum::http::HeaderValue::from_bytes(header_value) {
+        if let Ok(value) = HeaderValue::from_bytes(header_value) {
             req.headers_mut().insert("idempotency-key", value);
         }
 
-        hash_request(req, options).await.unwrap().1
+        hash_request(req, options).await.map(|(_, key)| key)
     }
 
     #[tokio::test]
@@ -420,39 +441,82 @@ mod tests {
     async fn test_direct_key_is_namespaced() {
         let options = direct_key_options();
         assert_eq!(
-            key_for(b"key-1", &options).await,
+            key_for(b"key-1", &options).await.unwrap(),
             Some(String::from("idem:key-1"))
         );
     }
 
+    /// A key the client meant to use but got wrong is an error, not a silent downgrade.
     #[tokio::test]
     async fn test_unusable_direct_keys_are_rejected() {
         let options = direct_key_options();
 
-        assert_eq!(key_for(b"", &options).await, None, "empty key");
-        assert_eq!(key_for(b"   ", &options).await, None, "whitespace-only key");
-        assert_eq!(
-            key_for(b"has space", &options).await,
-            None,
-            "embedded space"
-        );
-        assert_eq!(key_for(&[0xFF, 0xFE], &options).await, None, "non-utf8 key");
-        assert_eq!(
-            key_for("naïve".as_bytes(), &options).await,
-            None,
-            "non-ascii key"
-        );
-        assert_eq!(
-            key_for(&[b'k'; MAX_IDEMPOTENCY_KEY_LEN + 1], &options).await,
-            None,
-            "over-long key"
-        );
+        for (key, description) in [
+            (b"".as_slice(), "empty key"),
+            (b"   ", "whitespace-only key"),
+            (b"has space", "embedded space"),
+            (&[0xFF, 0xFE], "non-utf8 key"),
+            ("naïve".as_bytes(), "non-ascii key"),
+            (&[b'k'; MAX_IDEMPOTENCY_KEY_LEN + 1], "over-long key"),
+        ] {
+            let res = key_for(key, &options)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{description} should be rejected"));
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{description}");
+        }
+
         assert!(
             key_for(&[b'k'; MAX_IDEMPOTENCY_KEY_LEN], &options)
                 .await
+                .unwrap()
                 .is_some(),
             "a key at the length limit is accepted"
         );
+    }
+
+    /// Setting the mode used to be three flags that an unrelated option could undo.
+    #[tokio::test]
+    async fn test_direct_key_mode_survives_later_options() {
+        let options = direct_key_options().ignore_body(false).ignore_all_headers();
+
+        assert_eq!(
+            key_for(b"key-1", &options).await.unwrap(),
+            Some(String::from("idem:key-1")),
+            "the key should still come from the header"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_required_key_rejects_a_request_without_one() {
+        let options = direct_key_options().require_idempotency_key(true);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+
+        let res = hash_request(req, &options)
+            .await
+            .expect_err("should be rejected");
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_required_key_accepts_a_usable_one() {
+        let options = direct_key_options().require_idempotency_key(true);
+
+        assert_eq!(
+            key_for(b"key-1", &options).await.unwrap(),
+            Some(String::from("idem:key-1"))
+        );
+    }
+
+    #[test]
+    fn test_replay_header_name_accepts_any_case() {
+        let options = IdempotentOptions::default().replay_header_name("Idempotency-Replayed");
+        assert_eq!(options.replay_header_name.as_str(), "idempotency-replayed");
     }
 
     #[tokio::test]
