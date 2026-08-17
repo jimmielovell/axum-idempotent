@@ -32,9 +32,6 @@ const COUNT_LEN: usize = 4;
 const LENGTH_LEN: usize = 4;
 
 /// Feeds one length-prefixed field into the hash.
-///
-/// Without the length, the fields run together: `x-a: bc` and `x-ab: c` present the
-/// same bytes and so would produce the same key.
 fn hash_field(hasher: &mut Hasher, field: &[u8]) {
     hasher.update(&(field.len() as u64).to_be_bytes());
     hasher.update(field);
@@ -61,11 +58,7 @@ fn body_rejection(err: &axum::Error) -> Response {
     res
 }
 
-/// Computes the cache key for a request, returning the request alongside it.
-///
-/// A `None` key means the request is not eligible for idempotency handling and should be
-/// forwarded as-is. An `Err` means the body was consumed while reading it and the request
-/// can only be answered with the returned response.
+/// Computes the cache key for a request.
 pub(crate) async fn hash_request(
     mut req: Request,
     options: &IdempotentOptions,
@@ -90,8 +83,6 @@ pub(crate) async fn hash_request(
     hash_field(&mut hasher, req.method().as_str().as_bytes());
 
     let uri = req.uri();
-    // The query is part of what identifies the request: `?q=a` and `?q=b` are not
-    // the same operation.
     let target = uri.path_and_query().map_or(uri.path(), |pq| pq.as_str());
     hash_field(&mut hasher, target.as_bytes());
 
@@ -104,7 +95,7 @@ pub(crate) async fn hash_request(
                 if options.ignored_req_headers.contains(*name) {
                     return false;
                 }
-                if let Some(ignored_value) = options.ignored_header_values.get(name.to_owned()) {
+                if let Some(ignored_value) = options.ignored_header_values.get(*name) {
                     return value != ignored_value;
                 }
                 true
@@ -122,8 +113,7 @@ pub(crate) async fn hash_request(
     if !options.ignore_body {
         let (parts, body) = req.into_parts();
 
-        // A body already known to be over the limit is forwarded untouched: nothing is
-        // buffered, and the handler's own body limit still decides whether to accept it.
+        // A body already known to be over the limit is forwarded untouched
         if body
             .size_hint()
             .upper()

@@ -110,6 +110,7 @@
 
 use axum::RequestExt;
 use axum::extract::Request;
+use axum::http::HeaderValue;
 use axum::response::Response;
 use ruts::Session;
 use ruts::store::SessionStore;
@@ -117,6 +118,7 @@ use std::error::Error;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower_layer::Layer;
 use tower_service::Service;
@@ -131,12 +133,16 @@ use crate::utils::{bytes_to_response, hash_request, response_to_bytes};
 #[derive(Clone, Debug)]
 pub struct IdempotentService<S, T> {
     inner: S,
-    config: IdempotentOptions,
+    config: Arc<IdempotentOptions>,
     phantom: PhantomData<T>,
 }
 
 impl<S, T> IdempotentService<S, T> {
-    pub const fn new(inner: S, config: IdempotentOptions) -> Self {
+    pub fn new(inner: S, config: IdempotentOptions) -> Self {
+        Self::from_shared(inner, Arc::new(config))
+    }
+
+    fn from_shared(inner: S, config: Arc<IdempotentOptions>) -> Self {
         IdempotentService::<S, T> {
             inner,
             config,
@@ -177,16 +183,17 @@ where
 
             let (req, hash) = match hash_request(req, &config).await {
                 Ok(request_and_key) => request_and_key,
-                // The body was consumed while being read, so the handler can no longer
-                // be given the request.
+                // The body was consumed while being read
                 Err(res) => return Ok(res),
             };
 
             if let Some(hash) = &hash {
                 match check_cached_response(hash, &session).await {
                     Ok(Some(mut res)) => {
-                        res.headers_mut()
-                            .insert(config.replay_header_name, "true".parse().unwrap());
+                        res.headers_mut().insert(
+                            config.replay_header_name.clone(),
+                            HeaderValue::from_static("true"),
+                        );
                         return Ok(res);
                     }
                     Ok(None) => {} // No cached response, continue
@@ -211,7 +218,7 @@ where
                     #[cfg(feature = "layered-store")]
                     let result = session
                         .set(
-                            &hash,
+                            hash,
                             &response_bytes,
                             Some(config.body_cache_ttl_secs),
                             config.layered_hot_cache_ttl_secs,
@@ -220,7 +227,7 @@ where
                     #[cfg(not(feature = "layered-store"))]
                     let result = session
                         .set(
-                            &hash,
+                            hash,
                             &response_bytes,
                             Some(config.body_cache_ttl_secs),
                             None,
@@ -274,14 +281,14 @@ where
 /// ```
 #[derive(Clone, Debug)]
 pub struct IdempotentLayer<T> {
-    config: IdempotentOptions,
+    config: Arc<IdempotentOptions>,
     phantom_data: PhantomData<T>,
 }
 
 impl<T> IdempotentLayer<T> {
-    pub const fn new(config: IdempotentOptions) -> Self {
+    pub fn new(config: IdempotentOptions) -> Self {
         IdempotentLayer {
-            config,
+            config: Arc::new(config),
             phantom_data: PhantomData,
         }
     }
@@ -291,7 +298,7 @@ impl<S, T> Layer<S> for IdempotentLayer<T> {
     type Service = IdempotentService<S, T>;
 
     fn layer(&self, service: S) -> Self::Service {
-        IdempotentService::new(service, self.config.clone())
+        IdempotentService::from_shared(service, self.config.clone())
     }
 }
 
