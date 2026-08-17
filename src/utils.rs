@@ -1,5 +1,5 @@
 use crate::config::IdempotentOptions;
-use axum::body::{Body, to_bytes};
+use axum::body::{Body, HttpBody, to_bytes};
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::Response;
@@ -8,27 +8,41 @@ use std::error::Error;
 use std::str::FromStr;
 
 /// Prefix applied to every session field this middleware writes.
-///
-/// In direct-key mode the key comes straight from the client, so without a
-/// namespace of its own the middleware would read and overwrite whatever
-/// application field happens to share the name.
 const SESSION_FIELD_PREFIX: &str = "idem:";
 
 /// Upper bound on an accepted client-supplied idempotency key.
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
 
-/// A client-supplied key ends up as a session field name, so it is held to a
-/// bounded, printable subset rather than accepted verbatim.
 fn is_usable_idempotency_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= MAX_IDEMPOTENCY_KEY_LEN
         && key.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
+/// Builds the response for a request body that could not be buffered.
+fn body_rejection(err: &axum::Error) -> Response {
+    let over_limit = std::error::Error::source(err)
+        .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+
+    let mut res = Response::new(Body::empty());
+    *res.status_mut() = if over_limit {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+
+    res
+}
+
+/// Computes the cache key for a request, returning the request alongside it.
+///
+/// A `None` key means the request is not eligible for idempotency handling and should be
+/// forwarded as-is. An `Err` means the body was consumed while reading it and the request
+/// can only be answered with the returned response.
 pub(crate) async fn hash_request(
     mut req: Request,
     options: &IdempotentOptions,
-) -> (Request, Option<String>) {
+) -> Result<(Request, Option<String>), Response> {
     if options.use_idempotency_key && options.ignore_body && options.ignore_all_headers {
         let key = req
             .headers()
@@ -38,15 +52,11 @@ pub(crate) async fn hash_request(
                 if is_usable_idempotency_key(key) {
                     Some(format!("{SESSION_FIELD_PREFIX}{key}"))
                 } else {
-                    // The key itself is never logged: it is unvalidated client input.
-                    tracing::debug!(
-                        "ignoring idempotency key: expected 1-{MAX_IDEMPOTENCY_KEY_LEN} printable ascii characters"
-                    );
                     None
                 }
             });
 
-        return (req, key);
+        return Ok((req, key));
     }
 
     let mut hasher = Hasher::new();
@@ -79,16 +89,30 @@ pub(crate) async fn hash_request(
 
     if !options.ignore_body {
         let (parts, body) = req.into_parts();
-        let body_bytes = to_bytes(body, usize::MAX).await.unwrap();
-        hasher.update(&body_bytes);
 
+        // A body already known to be over the limit is forwarded untouched: nothing is
+        // buffered, and the handler's own body limit still decides whether to accept it.
+        if body
+            .size_hint()
+            .upper()
+            .is_some_and(|size| size > options.max_body_size as u64)
+        {
+            return Ok((Request::from_parts(parts, body), None));
+        }
+
+        let body_bytes = match to_bytes(body, options.max_body_size).await {
+            Ok(bytes) => bytes,
+            Err(err) => return Err(body_rejection(&err)),
+        };
+
+        hasher.update(&body_bytes);
         req = Request::from_parts(parts, Body::from(body_bytes));
     }
 
-    (
+    Ok((
         req,
         Some(format!("{}{}", SESSION_FIELD_PREFIX, hasher.finalize())),
-    )
+    ))
 }
 
 /// Serialize
@@ -173,6 +197,7 @@ fn parse_headers(header_bytes: &[u8]) -> Result<HeaderMap, Box<dyn Error + Send 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Bytes;
     use axum::http::{Method, StatusCode};
     use std::default::Default;
 
@@ -185,7 +210,9 @@ mod tests {
             .body(Body::from("test body"))
             .unwrap();
 
-        let (new_req, hash) = hash_request(req, &IdempotentOptions::default()).await;
+        let (new_req, hash) = hash_request(req, &IdempotentOptions::default())
+            .await
+            .unwrap();
 
         // Verify the new request matches original
         assert_eq!(new_req.method(), Method::POST);
@@ -202,7 +229,9 @@ mod tests {
             .body(Body::from("test body"))
             .unwrap();
 
-        let (_, hash2) = hash_request(req2, &IdempotentOptions::default()).await;
+        let (_, hash2) = hash_request(req2, &IdempotentOptions::default())
+            .await
+            .unwrap();
         assert_eq!(
             hash, hash2,
             "Hash should be deterministic for identical requests"
@@ -215,7 +244,9 @@ mod tests {
             .body(Body::from("different body"))
             .unwrap();
 
-        let (_, hash3) = hash_request(req3, &IdempotentOptions::default()).await;
+        let (_, hash3) = hash_request(req3, &IdempotentOptions::default())
+            .await
+            .unwrap();
         assert_ne!(hash, hash3, "Different body should produce different hash");
     }
 
@@ -234,7 +265,7 @@ mod tests {
             req.headers_mut().insert("idempotency-key", value);
         }
 
-        hash_request(req, options).await.1
+        hash_request(req, options).await.unwrap().1
     }
 
     #[tokio::test]
@@ -247,7 +278,8 @@ mod tests {
                 .unwrap(),
             &IdempotentOptions::default(),
         )
-        .await;
+        .await
+        .unwrap();
 
         let key = key.unwrap();
         assert!(key.starts_with(SESSION_FIELD_PREFIX));
@@ -304,14 +336,108 @@ mod tests {
                 .unwrap(),
             &direct_key_options(),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(key, None);
     }
 
+    /// A body with no `content-length`, so its size is not known before reading it.
+    fn chunked_body(chunks: Vec<Result<Bytes, std::io::Error>>) -> Body {
+        let body = Body::from_stream(futures_util::stream::iter(chunks));
+        assert_eq!(
+            body.size_hint().upper(),
+            None,
+            "test body should have an unknown length"
+        );
+        body
+    }
+
+    fn post_with_body(body: Body) -> Request {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/test")
+            .body(body)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_body_at_the_limit_is_hashed() {
+        let options = IdempotentOptions::default().max_body_size(64);
+        let req = post_with_body(Body::from(vec![b'x'; 64]));
+
+        let (req, key) = hash_request(req, &options).await.unwrap();
+
+        assert!(key.is_some());
+        let body = to_bytes(req.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.len(), 64);
+    }
+
+    /// Over the limit but with a known length: nothing is buffered and the request
+    /// reaches the handler intact, just without idempotency handling.
+    #[tokio::test]
+    async fn test_oversized_body_with_known_length_is_passed_through() {
+        let options = IdempotentOptions::default().max_body_size(64);
+        let req = post_with_body(Body::from(vec![b'x'; 65]));
+
+        let (req, key) = hash_request(req, &options).await.unwrap();
+
+        assert_eq!(key, None, "an oversized body must not be cached");
+        let body = to_bytes(req.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            body.len(),
+            65,
+            "the body must still be readable by the handler"
+        );
+    }
+
+    /// Over the limit with an unknown length: the body is consumed before the limit
+    /// is known to be exceeded, so it can no longer be handed to the handler.
+    #[tokio::test]
+    async fn test_oversized_body_with_unknown_length_is_rejected() {
+        let options = IdempotentOptions::default().max_body_size(64);
+        let req = post_with_body(chunked_body(vec![
+            Ok(Bytes::from(vec![b'x'; 40])),
+            Ok(Bytes::from(vec![b'x'; 40])),
+        ]));
+
+        let res = hash_request(req, &options)
+            .await
+            .expect_err("should be rejected");
+
+        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// A client disconnecting mid-upload
+    #[tokio::test]
+    async fn test_body_stream_error_is_rejected() {
+        let options = IdempotentOptions::default();
+        let req = post_with_body(chunked_body(vec![
+            Ok(Bytes::from("partial")),
+            Err(std::io::Error::other("connection reset")),
+        ]));
+
+        let res = hash_request(req, &options)
+            .await
+            .expect_err("should be rejected");
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_ignored_body_is_not_size_limited() {
+        let options = IdempotentOptions::default()
+            .ignore_body(true)
+            .max_body_size(8);
+        let req = post_with_body(Body::from(vec![b'x'; 4096]));
+
+        let (_, key) = hash_request(req, &options).await.unwrap();
+
+        assert!(key.is_some());
+    }
+
     #[tokio::test]
     async fn test_response_to_bytes() {
-        // Create a response with known values
         let response = Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain")
