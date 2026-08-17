@@ -31,6 +31,7 @@ pub struct IdempotentOptions {
     pub(crate) ignored_header_values: HeaderMap,
     pub(crate) ignore_all_headers: bool,
     pub(crate) max_body_size: usize,
+    pub(crate) max_cached_response_size: usize,
     pub(crate) body_cache_ttl_secs: i64,
     #[cfg(feature = "layered-store")]
     pub(crate) layered_hot_cache_ttl_secs: Option<i64>,
@@ -79,6 +80,20 @@ impl IdempotentOptions {
     /// [`DefaultBodyLimit`]: https://docs.rs/axum/latest/axum/extract/struct.DefaultBodyLimit.html
     pub fn max_body_size(mut self, bytes: usize) -> Self {
         self.max_body_size = bytes;
+        self
+    }
+
+    /// Sets the largest response body the middleware will store in the session.
+    ///
+    /// Defaults to 1 MB. A larger response is returned to the client but not cached, so a
+    /// repeat of the same request re-runs the handler.
+    ///
+    /// Responses whose length is not known before reading them — a stream, or anything else
+    /// sent without a `content-length` — are never cached, at any limit. Reading one here
+    /// would withhold it from the client until the stream ended, which for an open-ended
+    /// stream never happens.
+    pub fn max_cached_response_size(mut self, bytes: usize) -> Self {
+        self.max_cached_response_size = bytes;
         self
     }
 
@@ -169,6 +184,7 @@ impl Default for IdempotentOptions {
             ignored_res_status_codes: HashSet::new(),
             ignore_all_headers: false,
             max_body_size: 2 * 1024 * 1024,
+            max_cached_response_size: 1024 * 1024,
             #[cfg(feature = "layered-store")]
             layered_hot_cache_ttl_secs: None,
         };
