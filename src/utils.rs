@@ -31,6 +31,15 @@ const STATUS_LEN: usize = 2;
 const COUNT_LEN: usize = 4;
 const LENGTH_LEN: usize = 4;
 
+/// Feeds one length-prefixed field into the hash.
+///
+/// Without the length, the fields run together: `x-a: bc` and `x-ab: c` present the
+/// same bytes and so would produce the same key.
+fn hash_field(hasher: &mut Hasher, field: &[u8]) {
+    hasher.update(&(field.len() as u64).to_be_bytes());
+    hasher.update(field);
+}
+
 fn is_usable_idempotency_key(key: &str) -> bool {
     !key.is_empty()
         && key.len() <= MAX_IDEMPOTENCY_KEY_LEN
@@ -78,8 +87,13 @@ pub(crate) async fn hash_request(
     }
 
     let mut hasher = Hasher::new();
-    hasher.update(req.method().as_str().as_bytes());
-    hasher.update(req.uri().path().as_bytes());
+    hash_field(&mut hasher, req.method().as_str().as_bytes());
+
+    let uri = req.uri();
+    // The query is part of what identifies the request: `?q=a` and `?q=b` are not
+    // the same operation.
+    let target = uri.path_and_query().map_or(uri.path(), |pq| pq.as_str());
+    hash_field(&mut hasher, target.as_bytes());
 
     if !options.ignore_all_headers {
         // Collect and sort headers for consistent ordering
@@ -100,8 +114,8 @@ pub(crate) async fn hash_request(
         headers.sort_by(|(a_name, _), (b_name, _)| a_name.as_str().cmp(b_name.as_str()));
 
         for (name, value) in headers {
-            hasher.update(name.as_str().as_bytes());
-            hasher.update(value.as_bytes());
+            hash_field(&mut hasher, name.as_str().as_bytes());
+            hash_field(&mut hasher, value.as_bytes());
         }
     }
 
@@ -123,7 +137,7 @@ pub(crate) async fn hash_request(
             Err(err) => return Err(body_rejection(&err)),
         };
 
-        hasher.update(&body_bytes);
+        hash_field(&mut hasher, &body_bytes);
         req = Request::from_parts(parts, Body::from(body_bytes));
     }
 
@@ -327,6 +341,52 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(hash, hash3, "Different body should produce different hash");
+    }
+
+    async fn hashed_key(uri: &str, headers: &[(&str, &str)]) -> Option<String> {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+
+        for (name, value) in headers {
+            req.headers_mut().insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+
+        hash_request(req, &IdempotentOptions::default())
+            .await
+            .unwrap()
+            .1
+    }
+
+    #[tokio::test]
+    async fn test_query_string_is_part_of_the_key() {
+        assert_ne!(
+            hashed_key("/search?q=alice", &[]).await,
+            hashed_key("/search?q=bob", &[]).await,
+            "different queries are different requests"
+        );
+        assert_ne!(
+            hashed_key("/search?q=alice", &[]).await,
+            hashed_key("/search", &[]).await,
+        );
+        assert_eq!(
+            hashed_key("/search?q=alice", &[]).await,
+            hashed_key("/search?q=alice", &[]).await,
+        );
+    }
+
+    /// Undelimited fields let one request's headers imitate another's.
+    #[tokio::test]
+    async fn test_header_boundaries_are_unambiguous() {
+        assert_ne!(
+            hashed_key("/test", &[("x-a", "bc")]).await,
+            hashed_key("/test", &[("x-ab", "c")]).await,
+        );
     }
 
     fn direct_key_options() -> IdempotentOptions {
