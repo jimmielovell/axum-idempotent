@@ -97,10 +97,9 @@ To avoid caching transient server errors or certain client errors, responses wit
 
 In hashing mode, common, the following request-specific headers  are ignored by default to ensure that requests from different clients are treated as identical if the core parameters are the same. This does not apply when using use_idempotency_key_header.
 
+`accept`, `accept-encoding` and `accept-language` are **not** on this list: they choose which representation a handler returns, so a response cached for one client would otherwise be replayed to a client that asked for a different one.
+
 - user-agent,
-- accept,
-- accept-encoding,
-- accept-language,
 - cache-control,
 - connection,
 - cookie,

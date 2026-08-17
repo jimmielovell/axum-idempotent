@@ -235,11 +235,11 @@ impl Default for IdempotentOptions {
             layered_hot_cache_ttl_secs: None,
         };
 
+        // `accept`, `accept-encoding` and `accept-language` are deliberately absent: they
+        // select which representation the handler produces, so ignoring them serves one
+        // client the representation negotiated for another.
         let default_ignored_headers = [
             "user-agent",
-            "accept",
-            "accept-encoding",
-            "accept-language",
             "cache-control",
             "connection",
             "cookie",
