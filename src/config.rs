@@ -30,6 +30,7 @@ pub struct IdempotentOptions {
     pub(crate) ignored_res_status_codes: HashSet<StatusCode>,
     pub(crate) ignored_header_values: HeaderMap,
     pub(crate) ignore_all_headers: bool,
+    pub(crate) max_body_size: usize,
     pub(crate) body_cache_ttl_secs: i64,
     #[cfg(feature = "layered-store")]
     pub(crate) layered_hot_cache_ttl_secs: Option<i64>,
@@ -60,6 +61,24 @@ impl IdempotentOptions {
     /// are the same, which may not be the desired behavior.
     pub fn ignore_body(mut self, ignore: bool) -> Self {
         self.ignore_body = ignore;
+        self
+    }
+
+    /// Sets the largest request body the middleware will read in order to hash it.
+    ///
+    /// Defaults to 2 MB, matching axum's own [`DefaultBodyLimit`]. Ignored when
+    /// [`ignore_body`](Self::ignore_body) is set, since the body is never read then.
+    ///
+    /// A request whose length is known in advance to exceed this is forwarded to the handler
+    /// untouched, without idempotency handling, leaving the handler's own body limit to decide
+    /// whether to accept it. A request whose length is *not* known in advance (a chunked body
+    /// with no `content-length`) is read up to this limit, and rejected with
+    /// `413 Payload Too Large` if it exceeds it — by that point the body has been consumed and
+    /// can no longer be handed to the handler.
+    ///
+    /// [`DefaultBodyLimit`]: https://docs.rs/axum/latest/axum/extract/struct.DefaultBodyLimit.html
+    pub fn max_body_size(mut self, bytes: usize) -> Self {
+        self.max_body_size = bytes;
         self
     }
 
@@ -149,6 +168,7 @@ impl Default for IdempotentOptions {
             ignored_header_values: HeaderMap::new(),
             ignored_res_status_codes: HashSet::new(),
             ignore_all_headers: false,
+            max_body_size: 2 * 1024 * 1024,
             #[cfg(feature = "layered-store")]
             layered_hot_cache_ttl_secs: None,
         };

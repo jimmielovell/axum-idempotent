@@ -175,7 +175,12 @@ where
                 }
             };
 
-            let (req, hash) = hash_request(req, &config).await;
+            let (req, hash) = match hash_request(req, &config).await {
+                Ok(request_and_key) => request_and_key,
+                // The body was consumed while being read, so the handler can no longer
+                // be given the request.
+                Err(res) => return Ok(res),
+            };
 
             if let Some(hash) = &hash {
                 match check_cached_response(hash, &session).await {
