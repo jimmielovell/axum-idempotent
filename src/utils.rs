@@ -475,6 +475,18 @@ mod tests {
         );
     }
 
+    /// Content negotiation headers select what the handler returns, so they belong in the key.
+    #[tokio::test]
+    async fn test_negotiation_headers_are_part_of_the_key() {
+        for header in ["accept", "accept-encoding", "accept-language"] {
+            assert_ne!(
+                hashed_key("/test", &[(header, "a")]).await,
+                hashed_key("/test", &[(header, "b")]).await,
+                "{header} should affect the key"
+            );
+        }
+    }
+
     /// Setting the mode used to be three flags that an unrelated option could undo.
     #[tokio::test]
     async fn test_direct_key_mode_survives_later_options() {
