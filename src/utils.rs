@@ -1,17 +1,35 @@
 use crate::config::IdempotentOptions;
 use axum::body::{Body, HttpBody, to_bytes};
 use axum::extract::Request;
-use axum::http::{HeaderMap, HeaderName, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use blake3::Hasher;
 use std::error::Error;
-use std::str::FromStr;
 
 /// Prefix applied to every session field this middleware writes.
 const SESSION_FIELD_PREFIX: &str = "idem:";
 
 /// Upper bound on an accepted client-supplied idempotency key.
 const MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
+
+/// Layout of a cached response:
+///
+/// ```text
+/// u8            format version
+/// u16           status code
+/// u32           header count
+/// per header:   u32 name length, name, u32 value length, value
+/// body:         u32 length, body
+/// ```
+///
+/// Header names and values are length-prefixed rather than text-delimited so that
+/// repeated names survive and values are not required to be UTF-8.
+const CACHE_FORMAT_VERSION: u8 = 1;
+
+const VERSION_LEN: usize = 1;
+const STATUS_LEN: usize = 2;
+const COUNT_LEN: usize = 4;
+const LENGTH_LEN: usize = 4;
 
 fn is_usable_idempotency_key(key: &str) -> bool {
     !key.is_empty()
@@ -147,25 +165,29 @@ pub(crate) async fn response_to_bytes(
         }
     };
 
-    let mut result = Vec::new();
-    // Serialize status code
+    let headers = &parts.headers;
+    let mut result = Vec::with_capacity(
+        VERSION_LEN
+            + STATUS_LEN
+            + COUNT_LEN
+            + headers
+                .iter()
+                .map(|(name, value)| 2 * LENGTH_LEN + name.as_str().len() + value.len())
+                .sum::<usize>()
+            + LENGTH_LEN
+            + body_bytes.len(),
+    );
+
+    result.push(CACHE_FORMAT_VERSION);
     result.extend_from_slice(&parts.status.as_u16().to_be_bytes());
+    result.extend_from_slice(&(headers.len() as u32).to_be_bytes());
 
-    let headers = parts.headers.clone();
-    let len = headers.len();
-    for (i, (name, value)) in headers.iter().enumerate() {
-        result.extend_from_slice(name.as_str().as_bytes());
-        result.extend_from_slice(b": ");
-        result.extend_from_slice(value.as_bytes());
-
-        if i < len - 1 {
-            result.extend_from_slice(b"\r\n");
-        }
+    for (name, value) in headers {
+        write_field(&mut result, name.as_str().as_bytes());
+        write_field(&mut result, value.as_bytes());
     }
 
-    // headers/body separator (double CRLF)
-    result.extend_from_slice(b"\r\n\r\n");
-    result.extend_from_slice(&body_bytes);
+    write_field(&mut result, &body_bytes);
 
     (
         Response::from_parts(parts, Body::from(body_bytes)),
@@ -173,54 +195,82 @@ pub(crate) async fn response_to_bytes(
     )
 }
 
+fn write_field(out: &mut Vec<u8>, field: &[u8]) {
+    out.extend_from_slice(&(field.len() as u32).to_be_bytes());
+    out.extend_from_slice(field);
+}
+
+/// Reads a cached response
+struct Reader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, len: usize) -> Result<&'a [u8], Box<dyn Error + Send + Sync>> {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or("Cached response length overflowed")?;
+        let field = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or("Cached response ended early")?;
+
+        self.pos = end;
+        Ok(field)
+    }
+
+    fn take_u8(&mut self) -> Result<u8, Box<dyn Error + Send + Sync>> {
+        Ok(self.take(VERSION_LEN)?[0])
+    }
+
+    fn take_u16(&mut self) -> Result<u16, Box<dyn Error + Send + Sync>> {
+        let bytes = self.take(STATUS_LEN)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn take_u32(&mut self) -> Result<u32, Box<dyn Error + Send + Sync>> {
+        let bytes = self.take(LENGTH_LEN)?;
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// Reads one length-prefixed field.
+    fn take_field(&mut self) -> Result<&'a [u8], Box<dyn Error + Send + Sync>> {
+        let len = self.take_u32()? as usize;
+        self.take(len)
+    }
+}
+
 /// Deserialize bytes back into a `axum::response::Response`.
 pub(crate) fn bytes_to_response(bytes: Vec<u8>) -> Result<Response, Box<dyn Error + Send + Sync>> {
-    // Split the bytes into status code, headers, and body
-    let status_code_bytes = &bytes[0..2];
-    let status_code = u16::from_be_bytes([status_code_bytes[0], status_code_bytes[1]]);
-    let status_code = StatusCode::from_u16(status_code)?;
+    let mut reader = Reader {
+        bytes: &bytes,
+        pos: 0,
+    };
 
-    // End of headers (double CRLF: \r\n\r\n)
-    let header_end = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or("Invalid header format: missing double CRLF")?;
+    let version = reader.take_u8()?;
+    if version != CACHE_FORMAT_VERSION {
+        return Err(format!("Unsupported cached response format: {version}").into());
+    }
 
-    let header_bytes = &bytes[2..header_end];
-    let headers = parse_headers(header_bytes)?;
+    let status_code = StatusCode::from_u16(reader.take_u16()?)?;
 
-    // Skip both CRLFs after the header section (skip header_end + 4)
-    let body_bytes = &bytes[(header_end + 4)..];
-    let body = Body::from(body_bytes.to_vec());
+    let header_count = reader.take_u32()?;
+    let mut headers = HeaderMap::new();
 
-    let mut response = Response::new(body);
+    for _ in 0..header_count {
+        let name = HeaderName::from_bytes(reader.take_field()?)?;
+        let value = HeaderValue::from_bytes(reader.take_field()?)?;
+
+        headers.append(name, value);
+    }
+
+    let mut response = Response::new(Body::from(reader.take_field()?.to_vec()));
     *response.status_mut() = status_code;
     *response.headers_mut() = headers;
 
     Ok(response)
-}
-
-/// Parse headers from bytes.
-fn parse_headers(header_bytes: &[u8]) -> Result<HeaderMap, Box<dyn Error + Send + Sync>> {
-    let mut headers = HeaderMap::new();
-    let header_str = std::str::from_utf8(header_bytes)?;
-
-    for line in header_str.split("\r\n") {
-        if line.is_empty() {
-            continue;
-        }
-
-        let parts: Vec<&str> = line.splitn(2, ": ").collect();
-        if parts.len() != 2 {
-            return Err("Invalid header format".into());
-        }
-
-        let name = parts[0];
-        let value = parts[1];
-        headers.insert(HeaderName::from_str(name)?, value.parse()?);
-    }
-
-    Ok(headers)
 }
 
 #[cfg(test)]
@@ -599,23 +649,91 @@ mod tests {
             .status(StatusCode::OK)
             .header("First", "1")
             .header("Second", "2")
-            .body(Body::empty())
+            .body(Body::from("body"))
             .unwrap();
 
         let (_, bytes) = serialize(response).await;
 
-        // Skip status code (2 bytes)
-        let headers_and_body = &bytes[2..];
-        let headers_str = std::str::from_utf8(headers_and_body).unwrap();
+        // Header names are normalized to lowercase by the http crate.
+        let mut expected = vec![CACHE_FORMAT_VERSION];
+        expected.extend_from_slice(&200u16.to_be_bytes());
+        expected.extend_from_slice(&2u32.to_be_bytes());
+        for (name, value) in [("first", "1"), ("second", "2")] {
+            expected.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            expected.extend_from_slice(name.as_bytes());
+            expected.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            expected.extend_from_slice(value.as_bytes());
+        }
+        expected.extend_from_slice(&4u32.to_be_bytes());
+        expected.extend_from_slice(b"body");
 
-        // The header names are being normalized to lowercase by the http crate
-        // Headers should be:
-        // first: 1\r\n
-        // second: 2\r\n
-        // \r\n
+        assert_eq!(bytes, expected);
+    }
+
+    /// Collapsing these to one value silently drops cookies on every replay.
+    #[tokio::test]
+    async fn test_repeated_header_names_survive() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("set-cookie", "a=1")
+            .header("set-cookie", "b=2")
+            .body(Body::empty())
+            .unwrap();
+
+        let (_, bytes) = serialize(response).await;
+        let reconstructed = bytes_to_response(bytes).unwrap();
+
+        let cookies: Vec<_> = reconstructed
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .collect();
+        assert_eq!(cookies, ["a=1", "b=2"]);
+    }
+
+    /// `HeaderValue` permits obs-text, so a cached response must not assume UTF-8.
+    #[tokio::test]
+    async fn test_non_utf8_header_value_survives() {
+        let value = HeaderValue::from_bytes(b"attachment; filename=\"caf\xE9.pdf\"").unwrap();
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-disposition", value.clone())
+            .body(Body::empty())
+            .unwrap();
+
+        let (_, bytes) = serialize(response).await;
+        let reconstructed = bytes_to_response(bytes).unwrap();
+
         assert_eq!(
-            headers_str, "first: 1\r\nsecond: 2\r\n\r\n",
-            "Headers should be properly formatted with correct CRLF sequences"
+            reconstructed.headers().get("content-disposition"),
+            Some(&value)
         );
+    }
+
+    #[tokio::test]
+    async fn test_truncated_cached_response_is_an_error() {
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("x-test", "value")
+            .body(Body::from("body"))
+            .unwrap();
+
+        let (_, bytes) = serialize(response).await;
+
+        for len in 0..bytes.len() - 1 {
+            assert!(
+                bytes_to_response(bytes[..len].to_vec()).is_err(),
+                "a cached response truncated to {len} bytes should not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unknown_format_version_is_an_error() {
+        let mut bytes = vec![CACHE_FORMAT_VERSION + 1];
+        bytes.extend_from_slice(&200u16.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+
+        assert!(bytes_to_response(bytes).is_err());
     }
 }
