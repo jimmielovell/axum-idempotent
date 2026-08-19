@@ -52,8 +52,8 @@ fn bad_request(message: String) -> Response {
 
 /// Builds the response for a request body that could not be buffered.
 fn body_rejection(err: &axum::Error) -> Response {
-    let over_limit = std::error::Error::source(err)
-        .is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
+    let over_limit =
+        Error::source(err).is_some_and(|source| source.is::<http_body_util::LengthLimitError>());
 
     let mut res = Response::new(Body::empty());
     *res.status_mut() = if over_limit {
@@ -398,7 +398,7 @@ mod tests {
     }
 
     fn direct_key_options() -> IdempotentOptions {
-        IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"))
+        IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"), true)
     }
 
     async fn key_for(
@@ -501,7 +501,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_required_key_rejects_a_request_without_one() {
-        let options = direct_key_options().require_idempotency_key(true);
+        let options = direct_key_options();
 
         let req = Request::builder()
             .method(Method::POST)
@@ -517,7 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_required_key_accepts_a_usable_one() {
-        let options = direct_key_options().require_idempotency_key(true);
+        let options = direct_key_options();
 
         assert_eq!(
             key_for(b"key-1", &options).await.unwrap(),
@@ -533,13 +533,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_missing_direct_key_disables_caching() {
+        let options =
+            IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"), false);
+
         let (_, key) = hash_request(
             Request::builder()
                 .method(Method::POST)
                 .uri("/test")
                 .body(Body::empty())
                 .unwrap(),
-            &direct_key_options(),
+            &options,
         )
         .await
         .unwrap();

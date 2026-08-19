@@ -29,6 +29,7 @@ mod tests {
 
         let test_counter = counter.clone();
         let error_counter = counter.clone();
+        let validate_counter = counter.clone();
 
         let app = Router::new()
             .route(
@@ -45,6 +46,21 @@ mod tests {
                     async move {
                         counter.fetch_add(1, Ordering::SeqCst);
                         (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+                    }
+                }),
+            )
+            // Rejects one body and accepts any other, so a client can "fix" its payload.
+            .route(
+                "/validate",
+                post(move |body: String| {
+                    let counter = validate_counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        if body == "bad" {
+                            (StatusCode::UNPROCESSABLE_ENTITY, "invalid").into_response()
+                        } else {
+                            (StatusCode::OK, "accepted").into_response()
+                        }
                     }
                 }),
             )
@@ -140,7 +156,7 @@ mod tests {
     #[tokio::test]
     async fn test_idempotency_key_header_mode() {
         let options =
-            IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"));
+            IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"), true);
         let (app, counter) = create_test_app(options);
 
         let response1 = app
@@ -274,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn test_idempotency_key_cannot_address_application_session_fields() {
         let options =
-            IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"));
+            IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"), true);
         let (app, counter) = create_test_app(options);
 
         // Establish a session holding an application field named "user".
@@ -284,6 +300,7 @@ mod tests {
                 Request::builder()
                     .uri("/app-field")
                     .method("POST")
+                    .header("idempotency-key", "setup")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -318,6 +335,7 @@ mod tests {
                     .uri("/app-field")
                     .method("GET")
                     .header("cookie", session_cookie)
+                    .header("idempotency-key", "read-back")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -328,6 +346,68 @@ mod tests {
             &body[..],
             b"alice",
             "the idempotency key overwrote an application session field"
+        );
+    }
+
+    /// A rejected request has done no work, so a corrected retry under the same key must
+    /// reach the handler rather than be served the stale rejection for the whole TTL.
+    #[tokio::test]
+    async fn test_a_corrected_retry_is_not_served_the_cached_rejection() {
+        let options =
+            IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"), true);
+        let (app, counter) = create_test_app(options);
+
+        // A rejected response is not cached, so it establishes no session of its own.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app-field")
+                    .method("POST")
+                    .header("idempotency-key", "setup")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let session_cookie = get_session_cookie(&response);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/validate")
+                    .method("POST")
+                    .header("cookie", session_cookie.clone())
+                    .header("idempotency-key", "key-1")
+                    .body(Body::from("bad"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        // Same key, corrected payload: standard client retry behaviour.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/validate")
+                    .method("POST")
+                    .header("cookie", session_cookie)
+                    .header("idempotency-key", "key-1")
+                    .body(Body::from("good"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "the corrected retry never reached the handler"
         );
     }
 

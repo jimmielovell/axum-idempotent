@@ -87,7 +87,7 @@ impl IdempotentOptions {
     ///
     /// A request whose length is known in advance to exceed this is forwarded to the handler
     /// untouched, without idempotency handling, leaving the handler's own body limit to decide
-    /// whether to accept it. A request whose length is *not* known in advance (a chunked body
+    /// whether to accept it. A request whose length is not known in advance (a chunked body
     /// with no `content-length`) is read up to this limit, and rejected with
     /// `413 Payload Too Large` if it exceeds it — by that point the body has been consumed and
     /// can no longer be handed to the handler.
@@ -103,10 +103,8 @@ impl IdempotentOptions {
     /// Defaults to 1 MB. A larger response is returned to the client but not cached, so a
     /// repeat of the same request re-runs the handler.
     ///
-    /// Responses whose length is not known before reading them — a stream, or anything else
-    /// sent without a `content-length` — are never cached, at any limit. Reading one here
-    /// would withhold it from the client until the stream ended, which for an open-ended
-    /// stream never happens.
+    /// Responses whose length is not known before reading them; a stream, or anything else
+    /// sent without a `content-length` are never cached, at any limit.
     pub fn max_cached_response_size(mut self, bytes: usize) -> Self {
         self.max_cached_response_size = bytes;
         self
@@ -134,10 +132,17 @@ impl IdempotentOptions {
         self
     }
 
-    /// Adds a StatusCode to the list of status coded that should be ignored when
-    /// determining whether to cache the response or not.
+    /// Adds a status code to the list of responses that are not cached.
     pub fn ignore_response_status_code(mut self, status_code: StatusCode) -> Self {
         self.ignored_res_status_codes.insert(status_code);
+        self
+    }
+
+    /// Removes a status code from the list of responses that are not cached.
+    ///
+    /// The defaults are a preset, not a policy: use this to cache a status they exclude.
+    pub fn cache_response_status_code(mut self, status_code: StatusCode) -> Self {
+        self.ignored_res_status_codes.remove(&status_code);
         self
     }
 
@@ -155,13 +160,13 @@ impl IdempotentOptions {
     /// property of the layer, so [`ignore_body`](Self::ignore_body) and
     /// [`ignore_all_headers`](Self::ignore_all_headers) have no effect once it is set.
     ///
-    /// The key must be 1 to 255 printable ASCII characters (no spaces). A request carrying a
-    /// key outside that range is answered with `400 Bad Request`: the client asked for
+    /// The key must be 1 to 255 printable ASCII characters (no spaces). A request with a
+    /// key outside that range is rejected with `400 Bad Request`: the client asked for
     /// idempotency, so silently withholding it would surface later as a duplicate operation.
-    /// A request carrying *no* key is passed through without idempotency handling, since a
-    /// layer applied across a router sees plenty of requests that are not meant to be
-    /// idempotent — set [`require_idempotency_key`](Self::require_idempotency_key) to reject
-    /// those too.
+    ///
+    /// When `require_header` is `false`, a request carrying no key is passed through without
+    /// idempotency handling. Requiring the header also turns away requests a browser can be
+    /// induced to make cross-origin, which cannot set custom headers without a CORS preflight.
     ///
     /// Keys are namespaced internally, so they cannot collide with the session fields your
     /// application stores.
@@ -169,27 +174,17 @@ impl IdempotentOptions {
     /// Note that in this mode deduplication is advisory: the client chooses the key, so it
     /// also chooses whether two requests are treated as the same operation. Hashing mode
     /// derives the key from the request itself, which a sender cannot opt out of.
-    pub fn use_idempotency_key_header(mut self, header_name: Option<&str>) -> Self {
+    pub fn use_idempotency_key_header(
+        mut self,
+        header_name: Option<&str>,
+        require_header: bool,
+    ) -> Self {
+        self.require_idempotency_key = require_header;
         self.key_source = KeySource::Header(
             header_name
                 .unwrap_or(DEFAULT_IDEMPOTENCY_KEY_HEADER)
                 .to_string(),
         );
-        self
-    }
-
-    /// Answers a request carrying no idempotency key at all with `400 Bad Request`.
-    ///
-    /// A key that is present but unusable is rejected either way; this covers the ambiguous
-    /// case of a request that carries none. Requiring the header also turns away requests a
-    /// browser can be induced to make cross-origin, which cannot set custom headers without
-    /// a CORS preflight.
-    ///
-    /// Applies only in direct-key mode. The default is to forward such a request to the
-    /// handler without idempotency handling, which is silent: a client that misspells the
-    /// header, or omits it, loses the protection without being told.
-    pub fn require_idempotency_key(mut self, require: bool) -> Self {
-        self.require_idempotency_key = require;
         self
     }
 
@@ -235,9 +230,6 @@ impl Default for IdempotentOptions {
             layered_hot_cache_ttl_secs: None,
         };
 
-        // `accept`, `accept-encoding` and `accept-language` are deliberately absent: they
-        // select which representation the handler produces, so ignoring them serves one
-        // client the representation negotiated for another.
         let default_ignored_headers = [
             "user-agent",
             "cache-control",
@@ -265,6 +257,13 @@ impl Default for IdempotentOptions {
             StatusCode::BAD_REQUEST,
             StatusCode::FORBIDDEN,
             StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::LENGTH_REQUIRED,
+            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            StatusCode::URI_TOO_LONG,
             StatusCode::INTERNAL_SERVER_ERROR,
             StatusCode::REQUEST_TIMEOUT,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -277,5 +276,51 @@ impl Default for IdempotentOptions {
         }
 
         options
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_cached(options: &IdempotentOptions, status_code: StatusCode) -> bool {
+        !options.ignored_res_status_codes.contains(&status_code)
+    }
+
+    #[test]
+    fn test_request_envelope_rejections_are_not_cached_by_default() {
+        let options = IdempotentOptions::default();
+
+        for status_code in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::LENGTH_REQUIRED,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::URI_TOO_LONG,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+        ] {
+            assert!(!is_cached(&options, status_code), "{status_code}");
+        }
+    }
+
+    /// Both are plausible outcomes of an operation that ran, so they stay opt-in.
+    #[test]
+    fn test_not_found_and_conflict_are_still_cached_by_default() {
+        let options = IdempotentOptions::default();
+
+        assert!(is_cached(&options, StatusCode::NOT_FOUND));
+        assert!(is_cached(&options, StatusCode::CONFLICT));
+        assert!(is_cached(&options, StatusCode::OK));
+        assert!(is_cached(&options, StatusCode::CREATED));
+    }
+
+    #[test]
+    fn test_a_default_can_be_taken_back_off_the_list() {
+        let options = IdempotentOptions::default()
+            .cache_response_status_code(StatusCode::UNPROCESSABLE_ENTITY);
+
+        assert!(is_cached(&options, StatusCode::UNPROCESSABLE_ENTITY));
     }
 }
