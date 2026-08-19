@@ -1,25 +1,32 @@
 //! Middleware for handling idempotent requests in axum applications.
 //!
-//! This crate provides middleware that ensures idempotency of HTTP requests. When an
-//! identical request is made, a cached response is returned instead of re-executing
-//! the handler, preventing duplicate operations like accidental double payments.
+//! This crate provides middleware that deduplicates repeated HTTP requests. When a request
+//! repeats, the response cached from the first is returned instead of re-executing the
+//! handler, absorbing client retries and accidental double submissions.
 //!
 //! ## How it Works
 //!
-//! The middleware operates in one of two modes:
+//! The middleware operates in one of two modes.
 //!
-//! 1.  **Direct Key Mode (Recommended):** By configuring `use_idempotency_key_header()`, the
-//!     middleware uses a client-provided header (e.g., `Idempotency-Key`) value directly
-//!     as the cache key. This is the most performant and observable method, as it avoids
-//!     server-side hashing and uses an identifier known to both the client and server.
+//! 1.  **Direct Key Mode:** configured with [`use_idempotency_key_header`], the middleware
+//!     takes a client-provided header (e.g. `Idempotency-Key`) as the cache key. Nothing is
+//!     hashed, so the body is never buffered, and the key is the same identifier on both
+//!     sides.
 //!
-//! 2.  **Hashing Mode:** If not using a direct key, a unique hash is generated
-//!     from the request's method, path, headers (configurable), and body. This hash is
-//!     then used as the cache key.
+//! 2.  **Hashing Mode:** the default. The key is derived from the request's method, target,
+//!     headers (configurable) and body. Nothing is asked of the client and nothing can be
+//!     opted out of, so a repeated request is deduplicated whether the sender wanted
+//!     it.
+//!
+//! Prefer direct keys when the callers are yours, or are API consumers you can ask to send
+//! one. Prefer hashing when you cannot rely on the caller — browser form posts, third-party
+//! integrations — and want the protection applied regardless.
 //!
 //! If a key is found in the session store, the cached response is returned immediately.
 //! If not, the request is processed by the handler, and the response is cached before
 //! being sent to the client.
+//!
+//! [`use_idempotency_key_header`]: IdempotentOptions::use_idempotency_key_header
 //!
 //! ## Features
 //!
@@ -46,7 +53,7 @@
 //!
 //! // Configure the idempotency layer to use the "Idempotency-Key" header
 //! let idempotent_options = IdempotentOptions::default()
-//!     .use_idempotency_key_header(Some("Idempotency-Key"))
+//!     .use_idempotency_key_header(Some("Idempotency-Key"), true)
 //!     .expire_after(60 * 5); // Cache responses for 5 minutes
 //!
 //! // Create the router
@@ -77,12 +84,26 @@
 //! - `400 Bad Request`
 //! - `401 Unauthorized`
 //! - `403 Forbidden`
+//! - `405 Method Not Allowed`
 //! - `408 Request Timeout`
+//! - `411 Length Required`
+//! - `413 Payload Too Large`
+//! - `414 URI Too Long`
+//! - `415 Unsupported Media Type`
+//! - `422 Unprocessable Entity`
 //! - `429 Too Many Requests`
+//! - `431 Request Header Fields Too Large`
 //! - `500 Internal Server Error`
 //! - `502 Bad Gateway`
 //! - `503 Service Unavailable`
 //! - `504 Gateway Timeout`
+//!
+//! The `4xx` entries above describe the request envelope rather than the outcome of an
+//! operation: the handler never ran, so there is nothing to replay. `404` and `409` are
+//! absent, since both could be outcomes of a handler that did run.
+//!
+//! This list is a preset, not a policy: add to it with `ignore_response_status_code` and
+//! take from it with `cache_response_status_code`.
 //!
 //! ### Ignored Headers
 //!
@@ -91,10 +112,11 @@
 //! identical if the core parameters are the same. This does not apply when using
 //! `use_idempotency_key_header`.
 //!
+//! `accept`, `accept-encoding` and `accept-language` are **not** on this list: they choose
+//! which representation a handler returns, so a response cached for one client would
+//! otherwise be replayed to a client that asked for a different one.
+//!
 //! - user-agent,
-//! - accept,
-//! - accept-encoding,
-//! - accept-language,
 //! - cache-control,
 //! - connection,
 //! - cookie,
@@ -110,13 +132,16 @@
 
 use axum::RequestExt;
 use axum::extract::Request;
+use axum::http::HeaderValue;
 use axum::response::Response;
 use ruts::Session;
 use ruts::store::SessionStore;
+use serde_bytes::ByteBuf;
 use std::error::Error;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower_layer::Layer;
 use tower_service::Service;
@@ -131,12 +156,16 @@ use crate::utils::{bytes_to_response, hash_request, response_to_bytes};
 #[derive(Clone, Debug)]
 pub struct IdempotentService<S, T> {
     inner: S,
-    config: IdempotentOptions,
+    config: Arc<IdempotentOptions>,
     phantom: PhantomData<T>,
 }
 
 impl<S, T> IdempotentService<S, T> {
-    pub const fn new(inner: S, config: IdempotentOptions) -> Self {
+    pub fn new(inner: S, config: IdempotentOptions) -> Self {
+        Self::from_shared(inner, Arc::new(config))
+    }
+
+    fn from_shared(inner: S, config: Arc<IdempotentOptions>) -> Self {
         IdempotentService::<S, T> {
             inner,
             config,
@@ -175,13 +204,19 @@ where
                 }
             };
 
-            let (req, hash) = hash_request(req, &config).await;
+            let (req, hash) = match hash_request(req, &config).await {
+                Ok(request_and_key) => request_and_key,
+                // The body was consumed while being read
+                Err(res) => return Ok(res),
+            };
 
             if let Some(hash) = &hash {
                 match check_cached_response(hash, &session).await {
                     Ok(Some(mut res)) => {
-                        res.headers_mut()
-                            .insert(config.replay_header_name, "true".parse().unwrap());
+                        res.headers_mut().insert(
+                            config.replay_header_name.clone(),
+                            HeaderValue::from_static("true"),
+                        );
                         return Ok(res);
                     }
                     Ok(None) => {} // No cached response, continue
@@ -196,12 +231,19 @@ where
             let status_code = res.status();
             if !config.ignored_res_status_codes.contains(&status_code) {
                 if let Some(hash) = &hash {
-                    let (res, response_bytes) = response_to_bytes(res).await;
+                    let (res, response_bytes) =
+                        response_to_bytes(res, config.max_cached_response_size).await;
+
+                    let Some(response_bytes) = response_bytes else {
+                        return Ok(res);
+                    };
+
+                    let response_bytes = ByteBuf::from(response_bytes);
 
                     #[cfg(feature = "layered-store")]
                     let result = session
                         .set(
-                            &hash,
+                            hash,
                             &response_bytes,
                             Some(config.body_cache_ttl_secs),
                             config.layered_hot_cache_ttl_secs,
@@ -210,7 +252,7 @@ where
                     #[cfg(not(feature = "layered-store"))]
                     let result = session
                         .set(
-                            &hash,
+                            hash,
                             &response_bytes,
                             Some(config.body_cache_ttl_secs),
                             None,
@@ -264,14 +306,14 @@ where
 /// ```
 #[derive(Clone, Debug)]
 pub struct IdempotentLayer<T> {
-    config: IdempotentOptions,
+    config: Arc<IdempotentOptions>,
     phantom_data: PhantomData<T>,
 }
 
 impl<T> IdempotentLayer<T> {
-    pub const fn new(config: IdempotentOptions) -> Self {
+    pub fn new(config: IdempotentOptions) -> Self {
         IdempotentLayer {
-            config,
+            config: Arc::new(config),
             phantom_data: PhantomData,
         }
     }
@@ -281,7 +323,7 @@ impl<S, T> Layer<S> for IdempotentLayer<T> {
     type Service = IdempotentService<S, T>;
 
     fn layer(&self, service: S) -> Self::Service {
-        IdempotentService::new(service, self.config.clone())
+        IdempotentService::from_shared(service, self.config.clone())
     }
 }
 
@@ -289,10 +331,10 @@ async fn check_cached_response<T: SessionStore>(
     hash: impl AsRef<str>,
     session: &Session<T>,
 ) -> Result<Option<Response>, Box<dyn Error + Send + Sync>> {
-    let response_bytes = session.get::<Vec<u8>>(hash.as_ref()).await?;
+    let response_bytes = session.get::<ByteBuf>(hash.as_ref()).await?;
 
     let res = if let Some(bytes) = response_bytes {
-        let response = bytes_to_response(bytes)?;
+        let response = bytes_to_response(bytes.into_vec())?;
 
         Some(response)
     } else {
