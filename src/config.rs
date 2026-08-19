@@ -305,7 +305,6 @@ mod tests {
         }
     }
 
-    /// Both are plausible outcomes of an operation that ran, so they stay opt-in.
     #[test]
     fn test_not_found_and_conflict_are_still_cached_by_default() {
         let options = IdempotentOptions::default();

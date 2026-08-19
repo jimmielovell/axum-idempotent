@@ -1,7 +1,7 @@
 [package]
 name = "axum-idempotent"
 description = "A middleware for handling idempotent requests in axum applications."
-version = "0.2.7"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85.0"
 authors = ["Jimmie Lovell <jimmieomlovell@gmail.com>"]
@@ -12,6 +12,7 @@ categories = ["network-programming", "web-programming"]
 repository = "https://github.com/jimmielovell/axum-idempotent"
 documentation = "https://docs.rs/axum-idempotent"
 readme = "README.md"
+exclude = [".idea", ".DS_Store"]
 
 [features]
 layered-store = ["ruts/layered-store"]
