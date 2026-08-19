@@ -58,7 +58,7 @@ async fn main() {
 
     // Configure the idempotency layer to use the "Idempotency-Key" header
     let idempotent_options = IdempotentOptions::default()
-        .use_idempotency_key_header(Some("Idempotency-Key"))
+        .use_idempotency_key_header(Some("Idempotency-Key"), true)
         .expire_after(60 * 5); // Cache responses for 5 minutes
 
     // Create the router with the correct layer order
@@ -90,12 +90,23 @@ To avoid caching transient server errors or certain client errors, responses wit
 - 400 Bad Request
 - 401 Unauthorized
 - 403 Forbidden
+- 405 Method Not Allowed
 - 408 Request Timeout
+- 411 Length Required
+- 413 Payload Too Large
+- 414 URI Too Long
+- 415 Unsupported Media Type
+- 422 Unprocessable Entity
 - 429 Too Many Requests
+- 431 Request Header Fields Too Large
 - 500 Internal Server Error
 - 502 Bad Gateway
 - 503 Service Unavailable
 - 504 Gateway Timeout
+
+The `4xx` entries above describe the request envelope rather than the outcome of an operation: the handler never ran, so there is nothing to replay. `404` and `409` are deliberately absent, since both are plausible outcomes of an operation that did run.
+
+This list is a preset, not a policy: add to it with `ignore_response_status_code` and take from it with `cache_response_status_code`.
 
 ### Ignored Headers
 
