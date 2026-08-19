@@ -148,6 +148,7 @@ use axum::http::HeaderValue;
 use axum::response::Response;
 use ruts::Session;
 use ruts::store::SessionStore;
+use serde_bytes::ByteBuf;
 use std::error::Error;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -249,6 +250,11 @@ where
                         return Ok(res);
                     };
 
+                    // Stored as a byte string rather than a sequence of integers. The wire
+                    // bytes are the same, but it is copied in bulk instead of one `u8` at a
+                    // time through serde.
+                    let response_bytes = ByteBuf::from(response_bytes);
+
                     #[cfg(feature = "layered-store")]
                     let result = session
                         .set(
@@ -340,10 +346,10 @@ async fn check_cached_response<T: SessionStore>(
     hash: impl AsRef<str>,
     session: &Session<T>,
 ) -> Result<Option<Response>, Box<dyn Error + Send + Sync>> {
-    let response_bytes = session.get::<Vec<u8>>(hash.as_ref()).await?;
+    let response_bytes = session.get::<ByteBuf>(hash.as_ref()).await?;
 
     let res = if let Some(bytes) = response_bytes {
-        let response = bytes_to_response(bytes)?;
+        let response = bytes_to_response(bytes.into_vec())?;
 
         Some(response)
     } else {
