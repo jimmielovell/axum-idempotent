@@ -44,12 +44,12 @@
 //! use ruts::{CookieOptions, SessionLayer};
 //! use axum_idempotent::{IdempotentLayer, IdempotentOptions};
 //! use tower_cookies::CookieManagerLayer;
-//! use ruts::store::memory::MemoryStore;
+//! use ruts::store::moka::MokaStore;
 //!
 //! #[tokio::main]
 //! async fn main() {
 //! // Your session store
-//! let store = Arc::new(MemoryStore::new());
+//! let store = Arc::new(MokaStore::builder().build());
 //!
 //! // Configure the idempotency layer to use the "Idempotency-Key" header
 //! let idempotent_options = IdempotentOptions::default()
@@ -59,7 +59,7 @@
 //! // Create the router
 //! let app = Router::new()
 //!     .route("/payments", post(process_payment))
-//!     .layer(IdempotentLayer::<MemoryStore>::new(idempotent_options))
+//!     .layer(IdempotentLayer::<MokaStore>::new(idempotent_options))
 //!     .layer(SessionLayer::new(store)
 //!         .with_cookie_options(CookieOptions::build().name("session")))
 //!     .layer(CookieManagerLayer::new());
@@ -135,7 +135,7 @@ use axum::extract::Request;
 use axum::http::HeaderValue;
 use axum::response::Response;
 use ruts::Session;
-use ruts::store::SessionStore;
+use ruts::store::{SessionStore, Ttl};
 use serde_bytes::ByteBuf;
 use std::error::Error;
 use std::future::Future;
@@ -207,7 +207,7 @@ where
             let (req, hash) = match hash_request(req, &config).await {
                 Ok(request_and_key) => request_and_key,
                 // The body was consumed while being read
-                Err(res) => return Ok(res),
+                Err(res) => return Ok(*res),
             };
 
             if let Some(hash) = &hash {
@@ -231,6 +231,10 @@ where
             let status_code = res.status();
             if !config.ignored_res_status_codes.contains(&status_code) {
                 if let Some(hash) = &hash {
+                    if session.id().is_none() {
+                        return Ok(res);
+                    }
+
                     let (res, response_bytes) =
                         response_to_bytes(res, config.max_cached_response_size).await;
 
@@ -240,23 +244,19 @@ where
 
                     let response_bytes = ByteBuf::from(response_bytes);
 
+                    let cookie_ttl = session
+                        .cookie_max_age()
+                        .and_then(|secs| Ttl::new(i64::try_from(secs).ok()?).ok());
+                    let field_ttl = cookie_ttl
+                        .map_or(config.body_cache_ttl, |ttl| ttl.min(config.body_cache_ttl));
+
                     #[cfg(feature = "layered-store")]
-                    let result = session
-                        .set(
-                            hash,
-                            &response_bytes,
-                            Some(config.body_cache_ttl_secs),
-                            config.layered_hot_cache_ttl_secs,
-                        )
-                        .await;
+                    let hot_cache_ttl = config.layered_hot_cache_ttl.map(|ttl| ttl.min(field_ttl));
                     #[cfg(not(feature = "layered-store"))]
+                    let hot_cache_ttl = None;
+
                     let result = session
-                        .set(
-                            hash,
-                            &response_bytes,
-                            Some(config.body_cache_ttl_secs),
-                            None,
-                        )
+                        .set(hash, &response_bytes, field_ttl, hot_cache_ttl)
                         .await;
 
                     if let Err(err) = result {
@@ -288,11 +288,11 @@ where
 ///
 /// #[tokio::main]
 /// async fn main() {
-/// use ruts::store::memory::MemoryStore;
-/// let store = Arc::new(MemoryStore::new());
+/// use ruts::store::moka::MokaStore;
+/// let store = Arc::new(MokaStore::builder().build());
 ///
 /// let idempotent_options = IdempotentOptions::default().expire_after(3);
-/// let idempotent_layer = IdempotentLayer::<MemoryStore>::new(idempotent_options);
+/// let idempotent_layer = IdempotentLayer::<MokaStore>::new(idempotent_options);
 ///
 /// let app = Router::new()
 ///     .route("/test", get(|| async { "Hello, World!"}))

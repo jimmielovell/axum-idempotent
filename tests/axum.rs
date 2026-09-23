@@ -7,7 +7,8 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use axum_idempotent::{IdempotentLayer, IdempotentOptions};
-    use ruts::store::memory::MemoryStore;
+    use ruts::store::Ttl;
+    use ruts::store::moka::MokaStore;
     use ruts::{CookieOptions, Session, SessionLayer};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,15 +16,21 @@ mod tests {
     use tower::ServiceExt;
     use tower_cookies::CookieManagerLayer;
 
-    /// Builds an app along with the counter its handlers increment.
-    ///
-    /// The counter is per-app rather than a shared static so that tests remain
-    /// independent when the harness runs them in parallel.
     fn create_test_app(idempotent_options: IdempotentOptions) -> (Router, Arc<AtomicU64>) {
-        let store = Arc::new(MemoryStore::new());
-        let cookie_options = CookieOptions::build().name("session").max_age(10).path("/");
+        create_test_app_with_cookie_max_age(idempotent_options, 10)
+    }
+
+    fn create_test_app_with_cookie_max_age(
+        idempotent_options: IdempotentOptions,
+        cookie_max_age: u64,
+    ) -> (Router, Arc<AtomicU64>) {
+        let store = Arc::new(MokaStore::builder().build());
+        let cookie_options = CookieOptions::build()
+            .name("session")
+            .max_age(cookie_max_age)
+            .path("/");
         let session_layer = SessionLayer::new(store.clone()).with_cookie_options(cookie_options);
-        let idempotent_layer = IdempotentLayer::<MemoryStore>::new(idempotent_options);
+        let idempotent_layer = IdempotentLayer::<MokaStore>::new(idempotent_options);
 
         let counter = Arc::new(AtomicU64::new(0));
 
@@ -68,14 +75,14 @@ mod tests {
             // the middleware never addresses the same namespace.
             .route(
                 "/app-field",
-                post(|session: Session<MemoryStore>| async move {
+                post(|session: Session<MokaStore>| async move {
                     session
-                        .set("user", &String::from("alice"), None, None)
+                        .set("user", &String::from("alice"), Ttl::new(60).unwrap(), None)
                         .await
                         .unwrap();
                     "stored"
                 })
-                .get(|session: Session<MemoryStore>| async move {
+                .get(|session: Session<MokaStore>| async move {
                     match session.get::<String>("user").await {
                         Ok(Some(user)) => user,
                         Ok(None) => String::from("<missing>"),
@@ -88,6 +95,24 @@ mod tests {
             .layer(CookieManagerLayer::new());
 
         (app, counter)
+    }
+
+    async fn establish_session(
+        app: &Router,
+        idempotency_key: Option<&str>,
+    ) -> axum::http::HeaderValue {
+        let mut builder = Request::builder().uri("/app-field").method("POST");
+        if let Some(key) = idempotency_key {
+            builder = builder.header("idempotency-key", key);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        get_session_cookie(&response)
     }
 
     fn get_session_cookie(response: &axum::http::Response<Body>) -> axum::http::HeaderValue {
@@ -104,6 +129,7 @@ mod tests {
     async fn test_basic_idempotency_with_hashing() {
         let options = IdempotentOptions::default().expire_after(3);
         let (app, _counter) = create_test_app(options);
+        let session_cookie = establish_session(&app, None).await;
 
         let response1 = app
             .clone()
@@ -111,13 +137,13 @@ mod tests {
                 Request::builder()
                     .uri("/test")
                     .method("POST")
+                    .header("cookie", session_cookie.clone())
                     .body(Body::from("test"))
                     .unwrap(),
             )
             .await
             .unwrap();
 
-        let session_cookie = get_session_cookie(&response1);
         let body1 = to_bytes(response1.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body1[..], b"Response #0");
 
@@ -158,6 +184,7 @@ mod tests {
         let options =
             IdempotentOptions::default().use_idempotency_key_header(Some("idempotency-key"), true);
         let (app, counter) = create_test_app(options);
+        let session_cookie = establish_session(&app, Some("setup")).await;
 
         let response1 = app
             .clone()
@@ -165,6 +192,7 @@ mod tests {
                 Request::builder()
                     .uri("/test")
                     .method("POST")
+                    .header("cookie", session_cookie.clone())
                     .header("idempotency-key", "key-1")
                     .body(Body::empty())
                     .unwrap(),
@@ -172,7 +200,6 @@ mod tests {
             .await
             .unwrap();
 
-        let session_cookie = get_session_cookie(&response1);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert!(response1.headers().get("idempotency-replayed").is_none());
 
@@ -214,23 +241,24 @@ mod tests {
     async fn test_ignore_body_mode() {
         let options = IdempotentOptions::default().ignore_body(true);
         let (app, counter) = create_test_app(options);
+        let session_cookie = establish_session(&app, None).await;
 
         // First request executes handler.
-        let response1 = app
-            .clone()
+        app.clone()
             .oneshot(
                 Request::builder()
                     .uri("/test")
                     .method("POST")
+                    .header("cookie", session_cookie.clone())
                     .body(Body::from("body A"))
                     .unwrap(),
             )
             .await
             .unwrap();
-        let session_cookie = get_session_cookie(&response1);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-        // Second request with a different body should be treated as identical and return a cached response.
+        // Second request with a different body should be treated as identical
+        // and return a cached response.
         let response2 = app
             .oneshot(
                 Request::builder()
@@ -252,20 +280,20 @@ mod tests {
         let options =
             IdempotentOptions::default().ignore_header(HeaderName::from_static("x-request-id"));
         let (app, counter) = create_test_app(options);
+        let session_cookie = establish_session(&app, None).await;
 
-        let response1 = app
-            .clone()
+        app.clone()
             .oneshot(
                 Request::builder()
                     .uri("/test")
                     .method("POST")
+                    .header("cookie", session_cookie.clone())
                     .header("x-request-id", "123")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        let session_cookie = get_session_cookie(&response1);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
         let response2 = app
@@ -285,8 +313,6 @@ mod tests {
         assert_eq!(&body[..], b"Response #0");
     }
 
-    /// A client-supplied idempotency key must not be able to address an
-    /// application session field, either to read it or to overwrite it.
     #[tokio::test]
     async fn test_idempotency_key_cannot_address_application_session_fields() {
         let options =
@@ -408,6 +434,70 @@ mod tests {
             counter.load(Ordering::SeqCst),
             2,
             "the corrected retry never reached the handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cached_response_does_not_outlive_the_cookie() {
+        let options = IdempotentOptions::default().expire_after(60);
+        let (app, counter) = create_test_app_with_cookie_max_age(options, 1);
+        let session_cookie = establish_session(&app, None).await;
+
+        let request = || {
+            Request::builder()
+                .uri("/test")
+                .method("POST")
+                .header("cookie", session_cookie.clone())
+                .body(Body::from("same"))
+                .unwrap()
+        };
+
+        app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert!(response.headers().get("idempotency-replayed").is_none());
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "the response should have expired with the cookie, not after `expire_after`"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_request_without_a_session_is_not_cached() {
+        let (app, counter) = create_test_app(IdempotentOptions::default());
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/test")
+                        .method("POST")
+                        .body(Body::from("same"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert!(
+                response
+                    .headers()
+                    .get_all("set-cookie")
+                    .iter()
+                    .next()
+                    .is_none(),
+                "no session should be created just to cache a response"
+            );
+        }
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "nothing should have been cached to replay"
         );
     }
 
