@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+### Breaking
+
+- Requires `ruts` 0.11. `MemoryStore` is gone from `ruts`; use `MokaStore` behind its
+  `moka-store` feature.
+- A response is cached only when the request already carries a session. Routes reached
+  before the application establishes one lose idempotency.
+- `IdempotentOptions::new`, `expire_after` and `layered_cache_config` panic on a TTL
+  outside `0..=i32::MAX` seconds, rather than handing it to the store on every request.
+
+### Security
+
+- Caching a response no longer creates a session. A cache write called into `ruts`'s
+  `get_or_set_id`, so unauthenticated traffic could add a session, and a stored
+  response body, for every key it invented.
+
+### Fixed
+
+- A cached response is stored for no longer than the session cookie's `max_age`. Past
+  that the client cannot present the session to replay it, so a longer `expire_after`
+  only kept the session's data alive in the store. A `layered_cache_config` hot TTL is
+  held to the same bound.
+
 ## [0.3.0] - 2026-08-19
 
 ### Breaking
