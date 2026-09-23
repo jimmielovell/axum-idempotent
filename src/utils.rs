@@ -66,16 +66,21 @@ fn body_rejection(err: &axum::Error) -> Response {
 }
 
 /// Computes the cache key for a request.
+///
+/// The rejection is boxed because it is the rare path, while every request pays for the
+/// size of the `Result`.
 pub(crate) async fn hash_request(
     mut req: Request,
     options: &IdempotentOptions,
-) -> Result<(Request, Option<String>), Response> {
+) -> Result<(Request, Option<String>), Box<Response>> {
     if let CacheKeySource::Header(header_name) = &options.key_source {
         // Absence is ambiguous: plenty of requests to a layer applied router-wide are
         // not meant to be idempotent.
         let Some(value) = req.headers().get(header_name) else {
             return if options.require_idempotency_key {
-                Err(bad_request(format!("Missing `{header_name}` header")))
+                Err(Box::new(bad_request(format!(
+                    "Missing `{header_name}` header"
+                ))))
             } else {
                 Ok((req, None))
             };
@@ -88,9 +93,9 @@ pub(crate) async fn hash_request(
             .ok()
             .filter(|key| is_usable_idempotency_key(key))
         else {
-            return Err(bad_request(format!(
+            return Err(Box::new(bad_request(format!(
                 "`{header_name}` must be 1-{MAX_IDEMPOTENCY_KEY_LEN} printable ascii characters"
-            )));
+            ))));
         };
 
         let key = format!("{SESSION_FIELD_PREFIX}{key}");
@@ -142,7 +147,7 @@ pub(crate) async fn hash_request(
 
         let body_bytes = match to_bytes(body, options.max_body_size).await {
             Ok(bytes) => bytes,
-            Err(err) => return Err(body_rejection(&err)),
+            Err(err) => return Err(Box::new(body_rejection(&err))),
         };
 
         hash_field(&mut hasher, &body_bytes);
@@ -404,7 +409,7 @@ mod tests {
     async fn key_for(
         header_value: &[u8],
         options: &IdempotentOptions,
-    ) -> Result<Option<String>, Response> {
+    ) -> Result<Option<String>, Box<Response>> {
         let mut req = Request::builder()
             .method(Method::POST)
             .uri("/test")

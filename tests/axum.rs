@@ -15,7 +15,7 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
     use tower_cookies::CookieManagerLayer;
-    
+
     fn create_test_app(idempotent_options: IdempotentOptions) -> (Router, Arc<AtomicU64>) {
         create_test_app_with_cookie_max_age(idempotent_options, 10)
     }
@@ -96,7 +96,7 @@ mod tests {
 
         (app, counter)
     }
-    
+
     async fn establish_session(
         app: &Router,
         idempotency_key: Option<&str>,
@@ -257,7 +257,7 @@ mod tests {
             .unwrap();
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-        // Second request with a different body should be treated as identical 
+        // Second request with a different body should be treated as identical
         // and return a cached response.
         let response2 = app
             .oneshot(
@@ -312,7 +312,7 @@ mod tests {
         let body = to_bytes(response2.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&body[..], b"Response #0");
     }
-    
+
     #[tokio::test]
     async fn test_idempotency_key_cannot_address_application_session_fields() {
         let options =
@@ -436,7 +436,7 @@ mod tests {
             "the corrected retry never reached the handler"
         );
     }
-    
+
     #[tokio::test]
     async fn test_cached_response_does_not_outlive_the_cookie() {
         let options = IdempotentOptions::default().expire_after(60);
@@ -465,7 +465,7 @@ mod tests {
             "the response should have expired with the cookie, not after `expire_after`"
         );
     }
-    
+
     #[tokio::test]
     async fn test_a_request_without_a_session_is_not_cached() {
         let (app, counter) = create_test_app(IdempotentOptions::default());
