@@ -1,18 +1,13 @@
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use ruts::store::Ttl;
 use std::collections::HashSet;
 
 /// Default header read in direct-key mode.
 const DEFAULT_IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 
-/// Where the cache key comes from.
-///
-/// A single value rather than a set of flags, so that the mode cannot be changed as a
-/// side effect of setting an unrelated option.
 #[derive(Clone, Debug)]
-pub(crate) enum KeySource {
-    /// Hash the request's method, target, headers and body.
+pub(crate) enum CacheKeySource {
     Hash,
-    /// Take the value of this request header as the key.
     Header(String),
 }
 
@@ -37,7 +32,7 @@ pub(crate) enum KeySource {
 /// ```
 #[derive(Clone, Debug)]
 pub struct IdempotentOptions {
-    pub(crate) key_source: KeySource,
+    pub(crate) key_source: CacheKeySource,
     pub(crate) require_idempotency_key: bool,
     pub(crate) replay_header_name: HeaderName,
     pub(crate) ignore_body: bool,
@@ -47,22 +42,32 @@ pub struct IdempotentOptions {
     pub(crate) ignore_all_headers: bool,
     pub(crate) max_body_size: usize,
     pub(crate) max_cached_response_size: usize,
-    pub(crate) body_cache_ttl_secs: i64,
+    pub(crate) body_cache_ttl: Ttl,
     #[cfg(feature = "layered-store")]
-    pub(crate) layered_hot_cache_ttl_secs: Option<i64>,
+    pub(crate) layered_hot_cache_ttl: Option<Ttl>,
 }
 
 impl IdempotentOptions {
+    /// Creates options that cache responses for `body_cache_ttl_secs` seconds.
+    ///
+    /// # Panics
+    ///
+    /// If `body_cache_ttl_secs` is outside `0..=i32::MAX`.
     pub fn new(body_cache_ttl_secs: i64) -> Self {
-        Self {
-            body_cache_ttl_secs,
-            ..Default::default()
-        }
+        Self::default().expire_after(body_cache_ttl_secs)
     }
 
     /// Sets the expiration time in seconds for cached responses.
+    ///
+    /// A cached response never outlives the session cookie: when the session has a
+    /// `max_age`, the response is stored for whichever of the two is shorter, since a
+    /// client without the cookie cannot reach it anyway. `0` disables caching.
+    ///
+    /// # Panics
+    ///
+    /// If `seconds` is outside `0..=i32::MAX`.
     pub fn expire_after(mut self, seconds: i64) -> Self {
-        self.body_cache_ttl_secs = seconds;
+        self.body_cache_ttl = ttl_from_secs(seconds);
         self
     }
 
@@ -180,7 +185,7 @@ impl IdempotentOptions {
         require_header: bool,
     ) -> Self {
         self.require_idempotency_key = require_header;
-        self.key_source = KeySource::Header(
+        self.key_source = CacheKeySource::Header(
             header_name
                 .unwrap_or(DEFAULT_IDEMPOTENCY_KEY_HEADER)
                 .to_string(),
@@ -205,20 +210,30 @@ impl IdempotentOptions {
     /// strategy for the idempotent response.
     ///
     /// This requires the `layered-store` feature.
+    ///
+    /// # Panics
+    ///
+    /// If `hot_cache_ttl_secs` is outside `0..=i32::MAX`.
     #[cfg(feature = "layered-store")]
     pub fn layered_cache_config(mut self, hot_cache_ttl_secs: i64) -> Self {
-        self.layered_hot_cache_ttl_secs = Some(hot_cache_ttl_secs);
+        self.layered_hot_cache_ttl = Some(ttl_from_secs(hot_cache_ttl_secs));
         self
     }
+}
+
+/// Validated up front so that a bad value fails at startup, not on every request.
+fn ttl_from_secs(seconds: i64) -> Ttl {
+    Ttl::new(seconds)
+        .unwrap_or_else(|_| panic!("`{seconds}` is not a valid TTL: must be 0..={}", i32::MAX))
 }
 
 impl Default for IdempotentOptions {
     fn default() -> Self {
         let mut options = Self {
-            key_source: KeySource::Hash,
+            key_source: CacheKeySource::Hash,
             require_idempotency_key: false,
             replay_header_name: HeaderName::from_static("idempotency-replayed"),
-            body_cache_ttl_secs: 60 * 5, // 5 mins default
+            body_cache_ttl: ttl_from_secs(60 * 5), // 5 mins default
             ignore_body: false,
             ignored_req_headers: HashSet::new(),
             ignored_header_values: HeaderMap::new(),
@@ -227,7 +242,7 @@ impl Default for IdempotentOptions {
             max_body_size: 2 * 1024 * 1024,
             max_cached_response_size: 1024 * 1024,
             #[cfg(feature = "layered-store")]
-            layered_hot_cache_ttl_secs: None,
+            layered_hot_cache_ttl: None,
         };
 
         let default_ignored_headers = [

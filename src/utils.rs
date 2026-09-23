@@ -1,4 +1,4 @@
-use crate::config::{IdempotentOptions, KeySource};
+use crate::config::{CacheKeySource, IdempotentOptions};
 use axum::body::{Body, HttpBody, to_bytes};
 use axum::extract::Request;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
@@ -70,7 +70,7 @@ pub(crate) async fn hash_request(
     mut req: Request,
     options: &IdempotentOptions,
 ) -> Result<(Request, Option<String>), Response> {
-    if let KeySource::Header(header_name) = &options.key_source {
+    if let CacheKeySource::Header(header_name) = &options.key_source {
         // Absence is ambiguous: plenty of requests to a layer applied router-wide are
         // not meant to be idempotent.
         let Some(value) = req.headers().get(header_name) else {

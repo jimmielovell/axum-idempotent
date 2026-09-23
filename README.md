@@ -23,6 +23,8 @@ If a key is found in the session store, the cached response is returned immediat
 
 Both modes are best-effort. The middleware forwards a request without idempotency handling when the session or the store is unavailable, and two identical requests that arrive concurrently can both reach the handler. Treat it as a retry safety net, not as a guarantee that a handler runs at most once.
 
+A response is cached only for a request that already carries a session. The middleware never creates one, so a route reachable before your application establishes a session is not covered.
+
 ## Features
 
 -   Request deduplication using either a direct client-provided key or automatic request hashing.
@@ -49,12 +51,12 @@ use axum::{Router, routing::post};
 use ruts::{CookieOptions, SessionLayer};
 use axum_idempotent::{IdempotentLayer, IdempotentOptions};
 use tower_cookies::CookieManagerLayer;
-use ruts::store::memory::MemoryStore;
+use ruts::store::moka::MokaStore;
 
 #[tokio::main]
 async fn main() {
     // Your session store
-    let store = Arc::new(MemoryStore::new());
+    let store = Arc::new(MokaStore::builder().build());
 
     // Configure the idempotency layer to use the "Idempotency-Key" header
     let idempotent_options = IdempotentOptions::default()
@@ -64,7 +66,7 @@ async fn main() {
     // Create the router with the correct layer order
     let app = Router::new()
         .route("/payments", post(process_payment))
-        .layer(IdempotentLayer::<MemoryStore>::new(idempotent_options))
+        .layer(IdempotentLayer::<MokaStore>::new(idempotent_options))
         .layer(SessionLayer::new(store)
             .with_cookie_options(CookieOptions::build().name("session")))
         .layer(CookieManagerLayer::new());
