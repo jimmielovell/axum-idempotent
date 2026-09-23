@@ -7,17 +7,13 @@
 
 Middleware for handling idempotent requests in axum applications.
 
-This crate provides middleware that deduplicates repeated HTTP requests. When a request repeats, the response cached from the first is returned instead of re-executing the handler, absorbing client retries and accidental double submissions.
-
 ## How it Works
 
-The middleware operates in one of two modes. They differ in who controls deduplication, not only in cost, so neither is the right answer everywhere.
+The middleware operates in one of two modes. They differ in who controls deduplication.
 
-1.  **Direct Key Mode:** configured with `use_idempotency_key_header()`, the middleware takes a client-provided header (e.g. `Idempotency-Key`) as the cache key. Nothing is hashed, so the body is never buffered, and the key is the same identifier on both sides, which makes a replay easy to trace. Because the key stands for the *operation* rather than the bytes, a retry still deduplicates when the request is not byte-identical — re-serialized JSON, a changed header. The trade-off is that deduplication is advisory: the client picks the key, so the client also decides whether two requests count as the same operation.
+1.  **Direct Key Mode:** configured with `use_idempotency_key_header()`, the middleware takes a client-provided header (e.g. `Idempotency-Key`) as the cache key. Nothing is hashed, so the body is never buffered, and the key is the same identifier on both sides, which makes a replay easy to trace.
 
 2.  **Hashing Mode:** the default. The key is derived from the request's method, target, headers (configurable) and body. Nothing is asked of the client and nothing can be opted out of, so a repeated request is deduplicated whether or not the sender wanted it. The trade-off is that it only recognises byte-identical repeats: a client that re-serializes its body between attempts produces a different key and reaches the handler again.
-
-Prefer direct keys when the callers are yours, or are API consumers you can ask to send one. Prefer hashing when you cannot rely on the caller — browser form posts, third-party integrations — and want the protection applied regardless.
 
 If a key is found in the session store, the cached response is returned immediately. If not, the request is processed by the handler, and the response is cached before being sent to the client.
 
