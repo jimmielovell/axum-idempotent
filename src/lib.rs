@@ -207,7 +207,7 @@ where
             let (req, hash) = match hash_request(req, &config).await {
                 Ok(request_and_key) => request_and_key,
                 // The body was consumed while being read
-                Err(res) => return Ok(res),
+                Err(res) => return Ok(*res),
             };
 
             if let Some(hash) = &hash {
@@ -243,7 +243,7 @@ where
                     };
 
                     let response_bytes = ByteBuf::from(response_bytes);
-                    
+
                     let cookie_ttl = session
                         .cookie_max_age()
                         .and_then(|secs| Ttl::new(i64::try_from(secs).ok()?).ok());
