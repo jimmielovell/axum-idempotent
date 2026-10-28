@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0] - 2026-10-28
+
+### Breaking
+
+- Requires `ruts` 0.12.
+
+### Fixed
+
+- Caching a response re-sent the session cookie with `ruts`'s default `max_age`
+  (`ruts` 0.11 re-sent it on any field write), cutting short a longer lifetime the
+  application had set with `set_expiration`. With `ruts` 0.12 the cache write leaves
+  the client's cookie as it is.
+
 ## [0.4.0] - 2026-09-23
 
 ### Breaking
